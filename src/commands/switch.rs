@@ -2,7 +2,9 @@ use crate::commands::error_handler::ProgressSpinner;
 use crate::ssh::AsyncSshPool;
 use crate::types::NodeConfig;
 use anyhow::{anyhow, Result};
+use base64::{engine::general_purpose, Engine as _};
 use colored::*;
+use sha2::{Digest, Sha256};
 use std::io::Write;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -42,6 +44,17 @@ impl ConditionalSpinner {
             spinner.stop_with_message(message);
         }
     }
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(data))
+}
+
+fn decode_base64_payload(payload: &str) -> Result<Vec<u8>> {
+    let normalized: String = payload.chars().filter(|c| !c.is_whitespace()).collect();
+    general_purpose::STANDARD
+        .decode(normalized)
+        .map_err(|e| anyhow!("Failed to decode transferred tower data: {}", e))
 }
 
 pub async fn switch_command(dry_run: bool, app_state: &mut crate::AppState) -> Result<bool> {
@@ -1152,14 +1165,8 @@ impl SwitchManager {
 
         if !dry_run {
             let spinner = ConditionalSpinner::new("Verifying tower file integrity...");
-            // Calculate SHA256 checksum on source (active node)
-            let source_checksum = {
-                let ssh_key = self.get_ssh_key_for_node(&self.active_node_with_status.node.host)?;
-                let pool = self.ssh_pool.clone();
-                let sha_cmd = format!("sha256sum {} | cut -d' ' -f1", tower_path);
-                pool.execute_command(&self.active_node_with_status.node, &ssh_key, &sha_cmd)
-                    .await?
-            };
+            // Calculate SHA256 checksum from the exact bytes that were transferred.
+            let source_checksum = sha256_hex(&decode_base64_payload(&encoded_data)?);
 
             // Calculate SHA256 checksum on destination (standby node)
             let dest_checksum = {
