@@ -244,10 +244,10 @@ async fn check_firedancer_identity_config(
     // Get the Firedancer config file path
     let ps_cmd = match shell_type {
         RemoteShellType::Bash => {
-            "ps aux | grep -E 'fdctl.*--config' | grep -v grep"
+            "ps aux | grep 'fdctl.*--config ' | grep -v grep | head -1"
         }
         RemoteShellType::PowerShell | RemoteShellType::PowerShellCore => {
-            "ps aux | Select-String -Pattern 'fdctl.*--config' | Select-String -Pattern 'grep' -NotMatch"
+            "ps aux | Select-String -Pattern 'fdctl.*--config ' | Select-String -Pattern 'grep' -NotMatch | Select-Object -First 1"
         }
     };
     let process_info = ssh_pool
@@ -259,10 +259,12 @@ async fn check_firedancer_identity_config(
         .find(|line| line.contains("fdctl") && line.contains("--config"))
         .and_then(|line| {
             let parts: Vec<&str> = line.split_whitespace().collect();
-            parts
-                .windows(2)
-                .find(|w| w[0] == "--config")
-                .map(|w| w[1].to_string())
+            for i in 0..parts.len() {
+                if parts[i] == "--config" && i + 1 < parts.len() {
+                    return Some(parts[i + 1].to_string());
+                }
+            }
+            None
         })
         .ok_or_else(|| anyhow!("Failed to find Firedancer config path in running process"))?;
 
@@ -436,54 +438,116 @@ async fn check_firedancer_identity_config_inline(
     // Get the Firedancer config file path
     let ps_cmd = match shell_type {
         RemoteShellType::Bash => {
-            "ps aux | grep -E 'fdctl.*--config' | grep -v grep"
+            "ps auxww | grep --color=never 'fdctl.*--config ' | grep --color=never -v grep | head -1"
         }
         RemoteShellType::PowerShell | RemoteShellType::PowerShellCore => {
-            "ps aux | Select-String -Pattern 'fdctl.*--config' | Select-String -Pattern 'grep' -NotMatch"
+            "ps auxww | Select-String -Pattern 'fdctl.*--config ' | Select-String -Pattern 'grep' -NotMatch | Select-Object -First 1 | ForEach-Object { $_.Line }"
         }
     };
     let process_info = ssh_pool.execute_command(node, ssh_key, ps_cmd).await?;
+    
+    if process_info.trim().is_empty() {
+        // Firedancer process is not currently running; skip startup identity check.
+        return Ok(());
+    }
 
-    let config_path = process_info
-        .lines()
-        .find(|line| line.contains("fdctl") && line.contains("--config"))
-        .and_then(|line| {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            parts
-                .windows(2)
-                .find(|w| w[0] == "--config")
-                .map(|w| w[1].to_string())
+    let clean_process_info = strip_ansi(&process_info);
+    let parts: Vec<&str> = clean_process_info.split_whitespace().collect();
+
+    let config_path = parts
+        .windows(2)
+        .find_map(|w| {
+            let flag = w[0].trim_matches(|c| c == '\'' || c == '"');
+            if flag == "--config" {
+                Some(w[1].trim_matches(|c| c == '\'' || c == '"').to_string())
+            } else {
+                None
+            }
         })
-        .ok_or_else(|| anyhow!("Failed to find Firedancer config path"))?;
+        .ok_or_else(|| {
+            anyhow!("Failed to find Firedancer config path in process arguments")
+        })?;
 
-    // Read the consensus section from the config file
-    let config_cmd = match shell_type {
-        RemoteShellType::Bash => {
-            format!("grep -A10 '\\[consensus\\]' \"{}\" | grep -E 'identity_path|authorized_voter_paths' -A3", config_path)
+    let mut config_content: Option<String> = None;
+    let mut last_read_error: Option<String> = None;
+
+    for (command, args) in [
+        ("cat", vec![config_path.as_str()]),
+        ("sudo", vec!["cat", config_path.as_str()]),
+    ] {
+        match ssh_pool
+            .execute_command_with_args(node, ssh_key, command, &args)
+            .await
+        {
+            Ok(content) if !content.trim().is_empty() => {
+                config_content = Some(content);
+                break;
+            }
+            Ok(_) => {
+                last_read_error = Some(format!("{} {}: no output", command, args[0]));
+            }
+            Err(e) => {
+                last_read_error = Some(e.to_string());
+            }
         }
-        RemoteShellType::PowerShell | RemoteShellType::PowerShellCore => {
-            format!("Get-Content '{}' | Select-String -Pattern '\\[consensus\\]' -Context 0,10 | Select-String -Pattern 'identity_path|authorized_voter_paths' -Context 0,3", config_path)
-        }
+    }
+
+    let config_content = config_content.ok_or_else(|| {
+        anyhow!(
+            "Failed to read Firedancer config file: {}",
+            last_read_error.unwrap_or_else(|| "unknown error".to_string())
+        )
+    })?;
+
+    let extract_quoted = |line: &str| -> Option<String> {
+        let first_quote = line.find('"')?;
+        let rest = &line[first_quote + 1..];
+        let second_quote = rest.find('"')?;
+        Some(rest[..second_quote].to_string())
     };
-    let config_content = ssh_pool.execute_command(node, ssh_key, &config_cmd).await?;
 
-    // Parse identity_path
-    let identity_path = config_content
-        .lines()
-        .find(|line| line.trim_start().starts_with("identity_path"))
-        .and_then(|line| {
-            line.split('=')
-                .nth(1)
-                .and_then(|part| part.trim().split('"').nth(1))
-        })
-        .ok_or_else(|| anyhow!("Failed to parse identity_path"))?;
+    let mut in_consensus = false;
+    let mut in_authorized_voter_array = false;
+    let mut identity_path: Option<String> = None;
+    let mut authorized_voter_path: Option<String> = None;
 
-    // Parse authorized_voter_paths (first item)
-    let authorized_voter_path = config_content
-        .lines()
-        .skip_while(|line| !line.trim_start().starts_with("authorized_voter_paths"))
-        .nth(1) // Get the line after authorized_voter_paths = [
-        .and_then(|line| line.trim().split('"').nth(1))
+    for line in config_content.lines() {
+        let trimmed = line.trim();
+
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_consensus = trimmed == "[consensus]";
+            in_authorized_voter_array = false;
+            continue;
+        }
+
+        if !in_consensus {
+            continue;
+        }
+
+        if identity_path.is_none() && trimmed.starts_with("identity_path") {
+            identity_path = extract_quoted(trimmed);
+        }
+
+        if authorized_voter_path.is_none() && trimmed.starts_with("authorized_voter_paths") {
+            authorized_voter_path = extract_quoted(trimmed);
+            in_authorized_voter_array = authorized_voter_path.is_none();
+            continue;
+        }
+
+        if in_authorized_voter_array {
+            if trimmed.starts_with(']') {
+                in_authorized_voter_array = false;
+                continue;
+            }
+            if let Some(path) = extract_quoted(trimmed) {
+                authorized_voter_path = Some(path);
+                in_authorized_voter_array = false;
+            }
+        }
+    }
+
+    let identity_path = identity_path.ok_or_else(|| anyhow!("Failed to parse identity_path"))?;
+    let authorized_voter_path = authorized_voter_path
         .ok_or_else(|| anyhow!("Failed to parse authorized_voter_paths"))?;
 
     // Check if they're the same
