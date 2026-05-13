@@ -3,7 +3,7 @@ use anyhow::{anyhow, Result};
 use openssh::{Session, SessionBuilder, Stdio};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::RwLock;
 use tokio::time::timeout;
@@ -11,6 +11,7 @@ use tokio::time::timeout;
 /// SSH session pool with async support and connection reuse
 pub struct AsyncSshPool {
     sessions: Arc<RwLock<HashMap<String, Arc<Session>>>>,
+    last_health_checks: Arc<RwLock<HashMap<String, std::time::Instant>>>,
     shell_types: Arc<RwLock<HashMap<String, RemoteShellType>>>,
     config: PoolConfig,
 }
@@ -19,6 +20,7 @@ pub struct AsyncSshPool {
 pub struct PoolConfig {
     pub connect_timeout: Duration,
     pub max_idle_time: Duration,
+    pub health_check_interval: Duration,
     pub multiplex: bool,
 }
 
@@ -27,6 +29,7 @@ impl Default for PoolConfig {
         PoolConfig {
             connect_timeout: Duration::from_secs(10),
             max_idle_time: Duration::from_secs(300),
+            health_check_interval: Duration::from_secs(30),
             multiplex: true, // Enable connection multiplexing by default
         }
     }
@@ -40,6 +43,7 @@ impl AsyncSshPool {
     pub fn with_config(config: PoolConfig) -> Self {
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
+            last_health_checks: Arc::new(RwLock::new(HashMap::new())),
             shell_types: Arc::new(RwLock::new(HashMap::new())),
             config,
         }
@@ -105,10 +109,27 @@ impl AsyncSshPool {
         {
             let sessions = self.sessions.read().await;
             if let Some(session) = sessions.get(&key) {
-                // Check if session is still alive
-                if self.is_session_alive(session).await {
+                let should_probe = {
+                    let last_health_checks = self.last_health_checks.read().await;
+                    match last_health_checks.get(&key) {
+                        Some(last_check) => {
+                            last_check.elapsed() >= self.config.health_check_interval
+                        }
+                        None => true,
+                    }
+                };
+
+                if !should_probe || self.is_session_alive(session).await {
+                    if should_probe {
+                        let mut last_health_checks = self.last_health_checks.write().await;
+                        last_health_checks.insert(key.clone(), std::time::Instant::now());
+                    }
                     return Ok(Arc::clone(session));
                 }
+
+                // Session is stale; drop it so we reconnect cleanly below.
+                drop(sessions);
+                self.remove_session(&key).await;
             }
         }
 
@@ -130,7 +151,12 @@ impl AsyncSshPool {
         // Store session
         {
             let mut sessions = self.sessions.write().await;
-            sessions.insert(key, Arc::clone(&session_arc));
+            sessions.insert(key.clone(), Arc::clone(&session_arc));
+        }
+
+        {
+            let mut last_health_checks = self.last_health_checks.write().await;
+            last_health_checks.insert(key.clone(), std::time::Instant::now());
         }
 
         Ok(session_arc)
@@ -140,6 +166,9 @@ impl AsyncSshPool {
     pub async fn remove_session(&self, key: &str) {
         let mut sessions = self.sessions.write().await;
         sessions.remove(key);
+
+        let mut last_health_checks = self.last_health_checks.write().await;
+        last_health_checks.remove(key);
     }
 
     /// Get the cached shell type for a node, ensuring session exists first
@@ -610,7 +639,10 @@ impl AsyncSshPool {
 
         // Wrap the entire transfer operation in a timeout (2 minutes for large tower files)
         timeout(Duration::from_secs(120), async {
+            let total_start = Instant::now();
+
             // Start base64 -d on remote, writing to stdout
+            let read_start = Instant::now();
             let mut base64_child = session
                 .command("base64")
                 .arg("-d")
@@ -642,8 +674,10 @@ impl AsyncSshPool {
             if !status.success() {
                 return Err(anyhow!("base64 -d command failed"));
             }
+            let read_duration = read_start.elapsed();
 
             // Now send this decoded content to a remote file using dd
+            let write_start = Instant::now();
             let mut dd_child = session
                 .command("dd")
                 .arg(format!("of={}", remote_path))
@@ -667,6 +701,19 @@ impl AsyncSshPool {
             if !dd_status.success() {
                 return Err(anyhow!("dd command failed"));
             }
+            let write_duration = write_start.elapsed();
+
+            let total_duration = total_start.elapsed();
+
+            // Print detailed timings for debugging
+            println!(
+                "[ssh] transfer to {}: total {:.1}ms (read {:.1}ms, write {:.1}ms), bytes {}",
+                remote_path,
+                total_duration.as_secs_f64() * 1000.0,
+                read_duration.as_secs_f64() * 1000.0,
+                write_duration.as_secs_f64() * 1000.0,
+                decoded.len()
+            );
 
             Ok(())
         })
@@ -717,6 +764,9 @@ impl AsyncSshPool {
     pub async fn clear_all_sessions(&self) {
         let mut sessions = self.sessions.write().await;
         sessions.clear();
+
+        let mut last_health_checks = self.last_health_checks.write().await;
+        last_health_checks.clear();
     }
 
     /// Get pool statistics
