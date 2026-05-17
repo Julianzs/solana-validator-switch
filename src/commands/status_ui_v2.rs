@@ -5,6 +5,7 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use chrono::Local;
 
 /// Helper for acquiring read lock with timeout
 async fn read_lock_with_timeout<T>(
@@ -42,6 +43,7 @@ use ratatui::{
     widgets::{Block, Borders, Cell, Paragraph, Row, Table},
     Terminal,
 };
+use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -50,6 +52,10 @@ use tokio::time::interval;
 
 // Required imports for alerts and vote data
 use crate::alert::AlertManager;
+use crate::alert::ComprehensiveAlertTracker;
+use std::sync::{Mutex, OnceLock};
+
+static ALERT_TRACKER: OnceLock<Mutex<ComprehensiveAlertTracker>> = OnceLock::new();
 use crate::solana_rpc::{fetch_vote_account_data, ValidatorVoteData};
 use crate::types::{FailureTracker, NodeHealthStatus};
 use crate::{ssh::AsyncSshPool, AppState};
@@ -59,13 +65,24 @@ async fn refresh_vote_data_for_alerts(
     app_state: Arc<AppState>,
     ui_state: Arc<RwLock<UiState>>,
     log_sender: tokio::sync::mpsc::UnboundedSender<LogMessage>,
-    _alert_manager: Option<AlertManager>,
+    alert_manager: Option<AlertManager>,
 ) {
     let mut new_vote_data = Vec::new();
 
     // Fetch vote data for all validators
     for (idx, validator_status) in app_state.validator_statuses.iter().enumerate() {
         let validator_pair = &validator_status.validator_pair;
+        
+            // Use active node label for better identification
+            let node_label = if let Some(node_with_status) = validator_status
+                .nodes_with_status
+                .iter()
+                .find(|n| n.status == crate::types::NodeStatus::Active)
+            {
+                node_with_status.node.label.clone()
+            } else {
+                validator_status.nodes_with_status[0].node.label.clone()
+            };
 
         match fetch_vote_account_data(&validator_pair.rpc, &validator_pair.vote_pubkey).await {
             Ok(data) => {
@@ -77,7 +94,8 @@ async fn refresh_vote_data_for_alerts(
                 let _ = log_sender.send(LogMessage {
                     host: format!("validator-{}", idx),
                     message: format!(
-                        "Vote data fetched: last slot {}",
+                            "[{}] Vote data fetched: last slot {}",
+                            node_label,
                         data.recent_votes.last().map(|v| v.slot).unwrap_or(0)
                     ),
                     timestamp: Instant::now(),
@@ -94,7 +112,7 @@ async fn refresh_vote_data_for_alerts(
 
                 let _ = log_sender.send(LogMessage {
                     host: format!("validator-{}", idx),
-                    message: format!("Failed to fetch vote data: {}", e),
+                        message: format!("[{}] Failed to fetch vote data: {}", node_label, e),
                     timestamp: Instant::now(),
                     level: LogLevel::Error,
                 });
@@ -102,6 +120,166 @@ async fn refresh_vote_data_for_alerts(
                 new_vote_data.push(None);
             }
         }
+
+        // Spawn background health checks for each node: log getHealth and send low-priority alerts when configured
+        let app_state_health = app_state.clone();
+        let ui_state_health = ui_state.clone();
+        let log_sender_health = log_sender.clone();
+        let alert_manager_health = alert_manager.clone();
+
+        tokio::spawn(async move {
+            for (vidx, validator_status) in app_state_health.validator_statuses.iter().enumerate() {
+                for (nidx, node_with_status) in validator_status.nodes_with_status.iter().enumerate() {
+                    let node = node_with_status.node.clone();
+                    let node_status = node_with_status.status.clone();
+                    let validator_type = node_with_status.validator_type.clone();
+                    let ssh_key_opt = app_state_health.detected_ssh_keys.get(&node.host).cloned();
+                    let ssh_pool = app_state_health.ssh_pool.clone();
+                    let log_sender = log_sender_health.clone();
+                    let alert_mgr = alert_manager_health.clone();
+
+                    tokio::spawn(async move {
+                        // Prepare host tag for logs
+                        let host_tag = format!("validator-{}:node-{}", vidx, nidx);
+
+                        if let Some(ssh_key) = ssh_key_opt {
+                            let rpc_port = crate::validator_rpc::get_rpc_port(validator_type, None);
+                            match crate::validator_rpc::get_health(&*ssh_pool, &node, &ssh_key, rpc_port).await {
+                                Ok(is_healthy) => {
+                                    // Update UI state rpc health
+                                    if let Ok(mut st) = ui_state_health.try_write() {
+                                        if let Some(pair) = st.rpc_health_data.get_mut(vidx) {
+                                            let rpc_status = if nidx == 0 { &mut pair.node_0 } else { &mut pair.node_1 };
+                                            rpc_status.is_healthy = is_healthy;
+                                            rpc_status.last_check = Some(Instant::now());
+                                            rpc_status.error_message = None;
+                                            rpc_status.failure_start = None;
+                                        }
+                                    }
+
+                                    let _ = log_sender.send(LogMessage {
+                                        host: host_tag.clone(),
+                                        message: format!("getHealth -> {}", if is_healthy { "Healthy" } else { "Unhealthy" }),
+                                        timestamp: Instant::now(),
+                                        level: if is_healthy { LogLevel::Info } else { LogLevel::Warning },
+                                    });
+
+                                    // If standby and unhealthy -> send low-priority alert
+                                    if !is_healthy && node_status == crate::types::NodeStatus::Standby {
+                                        if let Some(am) = alert_mgr.as_ref() {
+                                            // Throttle using delinquency tracker for now
+                                            let _ = ALERT_TRACKER.get_or_init(|| {
+                                                Mutex::new(ComprehensiveAlertTracker::new(app_state_health.validator_statuses.len(), 2))
+                                            });
+                                            let tracker_mutex = ALERT_TRACKER.get().unwrap();
+                                            let mut tracker = tracker_mutex.lock().unwrap();
+                                            if tracker.delinquency_tracker.should_send_alert(vidx) {
+                                                let identity = app_state_health.validator_statuses[vidx].validator_pair.identity_pubkey.clone();
+                                                let res = am.send_backup_delinquency_alert(&identity, &node.label, 0, 0).await;
+                                                if let Err(e) = res {
+                                                    let _ = log_sender.send(LogMessage {
+                                                        host: host_tag.clone(),
+                                                        message: format!("Failed to send LOW-PRIORITY backup health alert: {}", e),
+                                                        timestamp: Instant::now(),
+                                                        level: LogLevel::Error,
+                                                    });
+                                                } else {
+                                                    let _ = log_sender.send(LogMessage {
+                                                        host: host_tag.clone(),
+                                                        message: "LOW-PRIORITY backup health alert sent".to_string(),
+                                                        timestamp: Instant::now(),
+                                                        level: LogLevel::Warning,
+                                                    });
+                                                }
+                                            } else {
+                                                let remaining = tracker.delinquency_tracker.seconds_until_next_alert(vidx).unwrap_or(0);
+                                                let _ = log_sender.send(LogMessage {
+                                                    host: host_tag.clone(),
+                                                    message: format!("Backup health alert suppressed by cooldown: {}s remaining", remaining),
+                                                    timestamp: Instant::now(),
+                                                    level: LogLevel::Info,
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    // Update rpc health failure state and possibly send low-priority alert after 30s
+                                    if let Ok(mut st) = ui_state_health.try_write() {
+                                        if let Some(pair) = st.rpc_health_data.get_mut(vidx) {
+                                            let rpc_status = if nidx == 0 { &mut pair.node_0 } else { &mut pair.node_1 };
+                                            rpc_status.is_healthy = false;
+                                            rpc_status.last_check = Some(Instant::now());
+                                            rpc_status.error_message = Some(e.to_string());
+                                            if rpc_status.failure_start.is_none() {
+                                                rpc_status.failure_start = Some(Instant::now());
+                                            }
+
+                                            // Check duration
+                                            if let Some(start) = rpc_status.failure_start {
+                                                let elapsed = start.elapsed().as_secs();
+                                                let threshold = 30u64;
+                                                let _ = log_sender.send(LogMessage {
+                                                    host: host_tag.clone(),
+                                                    message: format!("getHealth -> Unreachable: {} ({}s)", e, elapsed),
+                                                    timestamp: Instant::now(),
+                                                    level: LogLevel::Error,
+                                                });
+
+                                                if elapsed >= threshold {
+                                                    if let Some(am) = alert_mgr.as_ref() {
+                                                        // Throttle RPC failure alerts
+                                                        let _ = ALERT_TRACKER.get_or_init(|| {
+                                                            Mutex::new(ComprehensiveAlertTracker::new(app_state_health.validator_statuses.len(), 2))
+                                                        });
+                                                        let tracker_mutex = ALERT_TRACKER.get().unwrap();
+                                                        let mut tracker = tracker_mutex.lock().unwrap();
+                                                        if tracker.rpc_failure_tracker.should_send_alert(vidx) {
+                                                            let identity = app_state_health.validator_statuses[vidx].validator_pair.identity_pubkey.clone();
+                                                            let res = am.send_rpc_failure_alert_low_priority(&identity, &node.label, 1, elapsed, &e.to_string()).await;
+                                                            if let Err(e) = res {
+                                                                let _ = log_sender.send(LogMessage {
+                                                                    host: host_tag.clone(),
+                                                                    message: format!("Failed to send LOW-PRIORITY RPC failure alert: {}", e),
+                                                                    timestamp: Instant::now(),
+                                                                    level: LogLevel::Error,
+                                                                });
+                                                            } else {
+                                                                let _ = log_sender.send(LogMessage {
+                                                                    host: host_tag.clone(),
+                                                                    message: "LOW-PRIORITY RPC failure alert sent".to_string(),
+                                                                    timestamp: Instant::now(),
+                                                                    level: LogLevel::Warning,
+                                                                });
+                                                            }
+                                                        } else {
+                                                            let remaining = tracker.rpc_failure_tracker.seconds_until_next_alert(vidx).unwrap_or(0);
+                                                            let _ = log_sender.send(LogMessage {
+                                                                host: host_tag.clone(),
+                                                                message: format!("RPC failure alert suppressed by cooldown: {}s remaining", remaining),
+                                                                timestamp: Instant::now(),
+                                                                level: LogLevel::Info,
+                                                            });
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            let _ = log_sender.send(LogMessage {
+                                host: format!("validator-{}:node-{}", vidx, nidx),
+                                message: "No SSH key configured for host; skipping getHealth".to_string(),
+                                timestamp: Instant::now(),
+                                level: LogLevel::Error,
+                            });
+                        }
+                    });
+                }
+            }
+        });
     }
 
     // Update UI state and check for delinquency alerts
@@ -164,6 +342,163 @@ async fn refresh_vote_data_for_alerts(
         state.increment_times = new_increments;
         state.last_vote_slot_times = new_slot_times;
         state.last_vote_refresh = Instant::now();
+
+        // Run delinquency checks and send alerts if configured.
+        if let Some(alert_mgr) = alert_manager.as_ref() {
+            // Ensure the process-local alert tracker exists
+            let _ = ALERT_TRACKER.get_or_init(|| {
+                Mutex::new(ComprehensiveAlertTracker::new(
+                    app_state.validator_statuses.len(),
+                    2,
+                ))
+            });
+
+            // Lock tracker to check throttles
+            let tracker_mutex = ALERT_TRACKER.get().unwrap();
+            let mut tracker = tracker_mutex.lock().unwrap();
+
+            // Collect alerts to send without holding locks while awaiting network calls
+            let mut alerts_to_send: Vec<(usize, bool, crate::types::NodeConfig, u64, u64, NodeHealthStatus, bool)> = Vec::new();
+
+            for (idx, last) in state.last_vote_slot_times.iter().enumerate() {
+                if let Some((last_slot, last_instant)) = last {
+                    let seconds_since_vote = last_instant.elapsed().as_secs();
+                    let threshold = app_state
+                        .config
+                        .alert_config
+                        .as_ref()
+                        .map(|c| c.delinquency_threshold_seconds)
+                        .unwrap_or(30);
+
+
+                    // Log delinquency check for debugging
+                    let _ = log_sender.send(LogMessage {
+                        host: format!("validator-{}", idx),
+                            message: format!("[{}] Delinquency check: {} seconds without vote (threshold: {}s)", 
+                                // Use active node label for identification
+                                if let Some(node_with_status) = app_state.validator_statuses[idx]
+                                    .nodes_with_status
+                                    .iter()
+                                    .find(|n| n.status == crate::types::NodeStatus::Active)
+                                {
+                                    node_with_status.node.label.as_str()
+                                } else {
+                                    app_state.validator_statuses[idx].nodes_with_status[0].node.label.as_str()
+                                },
+                                seconds_since_vote, threshold),
+                        timestamp: Instant::now(),
+                        level: LogLevel::Info,
+                    });
+
+                    if seconds_since_vote >= threshold {
+                        if tracker.delinquency_tracker.should_send_alert(idx) {
+                            // proceed to enqueue alert
+                        } else {
+                            // Alert suppressed due to cooldown - log suppression with remaining time
+                            let remaining = tracker
+                                .delinquency_tracker
+                                .seconds_until_next_alert(idx)
+                                .unwrap_or(0);
+
+                            let _ = log_sender.send(LogMessage {
+                                host: format!("validator-{}", idx),
+                                message: format!(
+                                    "Delinquency alert suppressed by cooldown: {}s remaining (threshold: {}s)",
+                                    remaining, threshold
+                                ),
+                                timestamp: Instant::now(),
+                                level: LogLevel::Info,
+                            });
+
+                            // skip enqueueing
+                            continue;
+                        }
+                        // Determine active node (fallback to first node)
+                        let active_node = if let Some(node_with_status) = app_state
+                            .validator_statuses[idx]
+                            .nodes_with_status
+                            .iter()
+                            .find(|n| n.status == crate::types::NodeStatus::Active)
+                        {
+                            node_with_status.node.clone()
+                        } else {
+                            app_state.validator_statuses[idx].nodes_with_status[0].node.clone()
+                        };
+
+                        // Determine priority by role: if active node is reporting as Active, it's high priority; otherwise low
+                        let is_active = app_state.validator_statuses[idx]
+                            .nodes_with_status
+                            .iter()
+                            .any(|n| n.status == crate::types::NodeStatus::Active);
+                        let is_backup = !is_active;
+                        let node_health = state.validator_health[idx].clone();
+
+                        alerts_to_send.push((idx, is_backup, active_node, *last_slot, seconds_since_vote, node_health, is_active));
+                    }
+                }
+            }
+
+            // Release tracker lock before awaiting network calls
+            drop(tracker);
+
+            for (idx, is_backup, active_node, last_slot, seconds_since_vote, node_health, is_active) in alerts_to_send {
+                let alert_mgr = alert_mgr.clone();
+                let log_sender = log_sender.clone();
+                let identity = app_state.validator_statuses[idx].validator_pair.identity_pubkey.clone();
+                // Pre-send log: record alert intent and priority
+                let _ = log_sender.send(LogMessage {
+                    host: format!("validator-{}", idx),
+                    message: format!(
+                        "Preparing to send {} delinquency alert for {}: {}s without vote",
+                        if is_backup { "LOW-PRIORITY" } else { "HIGH-PRIORITY" },
+                        active_node.label,
+                        seconds_since_vote
+                    ),
+                    timestamp: Instant::now(),
+                    level: LogLevel::Info,
+                });
+
+                tokio::spawn(async move {
+                    let res = if is_backup {
+                        alert_mgr
+                            .send_backup_delinquency_alert(
+                                &identity,
+                                &active_node.label,
+                                last_slot,
+                                seconds_since_vote,
+                            )
+                            .await
+                    } else {
+                        alert_mgr
+                            .send_delinquency_alert_with_health(
+                                &identity,
+                                &active_node.label,
+                                is_active,
+                                last_slot,
+                                seconds_since_vote,
+                                &node_health,
+                            )
+                            .await
+                    };
+
+                    if let Err(e) = res {
+                        let _ = log_sender.send(LogMessage {
+                            host: format!("validator-{}", idx),
+                            message: format!("Failed to send {} delinquency alert: {}", if is_backup { "LOW-PRIORITY" } else { "HIGH-PRIORITY" }, e),
+                            timestamp: Instant::now(),
+                            level: LogLevel::Error,
+                        });
+                    } else {
+                        let _ = log_sender.send(LogMessage {
+                            host: format!("validator-{}", idx),
+                            message: format!("{} delinquency alert sent: {} seconds without vote", if is_backup { "LOW-PRIORITY" } else { "HIGH-PRIORITY" }, seconds_since_vote),
+                            timestamp: Instant::now(),
+                            level: LogLevel::Warning,
+                        });
+                    }
+                });
+            }
+        }
     }
 }
 
@@ -236,6 +571,7 @@ async fn process_ui_action(
     view_state: &Arc<RwLock<ViewState>>,
     app_state: &Arc<AppState>,
     switch_confirmed: &Arc<RwLock<bool>>,
+    log_sender: &tokio::sync::mpsc::UnboundedSender<LogMessage>,
 ) -> Result<()> {
     match action {
         UiAction::Quit => {
@@ -280,11 +616,11 @@ async fn process_ui_action(
         }
         UiAction::Refresh => {
             // Handle refresh with timeout
-            handle_refresh_with_timeout(ui_state, app_state).await?;
+            handle_refresh_with_timeout(ui_state, app_state, log_sender).await?;
         }
         UiAction::NextValidator => {
             // Handle validator switch with timeout
-            handle_validator_switch_with_timeout(ui_state, app_state).await?;
+            handle_validator_switch_with_timeout(ui_state, app_state, log_sender).await?;
         }
     }
 
@@ -295,6 +631,7 @@ async fn process_ui_action(
 async fn handle_refresh_with_timeout(
     ui_state: &Arc<RwLock<UiState>>,
     app_state: &Arc<AppState>,
+    log_sender: &tokio::sync::mpsc::UnboundedSender<LogMessage>,
 ) -> Result<()> {
     // Try to acquire write lock with timeout
     let ui_write = tokio::time::timeout(Duration::from_millis(50), ui_state.write()).await;
@@ -325,8 +662,9 @@ async fn handle_refresh_with_timeout(
     let ui_state_clone = ui_state.clone();
 
     // Spawn the refresh operation without blocking
+    let log_sender_clone = log_sender.clone();
     tokio::spawn(async move {
-        refresh_all_fields(app_state_clone, ui_state_clone).await;
+        refresh_all_fields(app_state_clone, ui_state_clone, log_sender_clone).await;
     });
 
     Ok(())
@@ -336,6 +674,7 @@ async fn handle_refresh_with_timeout(
 async fn handle_validator_switch_with_timeout(
     ui_state: &Arc<RwLock<UiState>>,
     app_state: &Arc<AppState>,
+    log_sender: &tokio::sync::mpsc::UnboundedSender<LogMessage>,
 ) -> Result<()> {
     // Only switch if multiple validators exist
     if app_state.validator_statuses.len() <= 1 {
@@ -376,8 +715,9 @@ async fn handle_validator_switch_with_timeout(
     let ui_state_clone = ui_state.clone();
 
     // Spawn the refresh operation without blocking
+    let log_sender_clone = log_sender.clone();
     tokio::spawn(async move {
-        refresh_all_fields(app_state_clone, ui_state_clone).await;
+        refresh_all_fields(app_state_clone, ui_state_clone, log_sender_clone).await;    
     });
 
     Ok(())
@@ -504,6 +844,7 @@ pub struct RpcHealthStatus {
     pub is_healthy: bool,
     pub last_check: Option<Instant>,
     pub error_message: Option<String>,
+    pub failure_start: Option<Instant>,
 }
 
 #[derive(Clone)]
@@ -535,7 +876,31 @@ impl EnhancedStatusApp {
         let ssh_pool = Arc::clone(&app_state.ssh_pool);
 
         // Create unbounded channel for log messages
-        let (log_sender, _log_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (log_sender, mut log_receiver) = tokio::sync::mpsc::unbounded_channel::<LogMessage>();
+
+        let log_path = dirs::home_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join(".solana-validator-switch")
+            .join("logs")
+            .join("latest.log");
+
+        tokio::spawn(async move {
+            while let Some(message) = log_receiver.recv().await {
+                let level = match message.level {
+                    LogLevel::Info => "INFO",
+                    LogLevel::Warning => "WARNING",
+                    LogLevel::Error => "ERROR",
+                };
+
+                let timestamp = Local::now().format("%H:%M:%S%.3f");
+                let line = format!("[{}] [{}] {}: {}\n", timestamp, level, message.host, message.message);
+
+                if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&log_path) {
+                    let _ = file.write_all(line.as_bytes());
+                    let _ = file.flush();
+                }
+            }
+        });
 
         // Initialize UI state
         let mut initial_vote_data = Vec::new();
@@ -600,11 +965,13 @@ impl EnhancedStatusApp {
                     is_healthy: false,
                     last_check: None,
                     error_message: None,
+                    failure_start: None,
                 },
                 node_1: RpcHealthStatus {
                     is_healthy: false,
                     last_check: None,
                     error_message: None,
+                    failure_start: None,
                 },
             };
             initial_rpc_health_data.push(rpc_pair);
@@ -775,8 +1142,9 @@ impl EnhancedStatusApp {
                 let ui_state_clone = ui_state_for_refresh.clone();
                 let app_state_clone = app_state_for_refresh.clone();
 
+                let log_sender_clone = log_sender.clone();
                 tokio::spawn(async move {
-                    refresh_all_fields(app_state_clone, ui_state_clone).await;
+                    refresh_all_fields(app_state_clone, ui_state_clone, log_sender_clone).await;
                 });
             }
         });
@@ -853,12 +1221,12 @@ impl EnhancedStatusApp {
                                 (should_alert, consecutive, seconds)
                             };
 
-                            // Send RPC failure alert if needed
+                            // Send RPC failure alert if needed (low-priority)
                             if should_alert_rpc {
                                 if let Some(alert_mgr) = alert_manager.as_ref() {
-                                    let _ = alert_mgr.send_rpc_failure_alert(
+                                    let _ = alert_mgr.send_rpc_failure_alert_low_priority(
                                         &validator_pair.identity_pubkey,
-                                        &validator_pair.vote_pubkey,
+                                        "Vote Data RPC Endpoint",
                                         consecutive_failures,
                                         seconds_since_first,
                                         &e.to_string()
@@ -922,6 +1290,14 @@ impl EnhancedStatusApp {
                                         .map(|c| c.delinquency_threshold_seconds)
                                         .unwrap_or(30);
 
+                                    // Log delinquency check for debugging
+                                    let _ = log_sender.send(LogMessage {
+                                        host: format!("validator-{}", idx),
+                                        message: format!("Delinquency check: {} seconds without vote (threshold: {}s)", seconds_since_vote, threshold),
+                                        timestamp: Instant::now(),
+                                        level: LogLevel::Info,
+                                    });
+
                                     if seconds_since_vote >= threshold
                                         && alert_tracker.delinquency_tracker.should_send_alert(idx)
                                     {
@@ -946,9 +1322,24 @@ impl EnhancedStatusApp {
                                         // Get current health status
                                         let node_health = state.validator_health[idx].clone();
 
-                                        // Send alert with health status
-                                        if let Err(e) = alert_mgr
-                                            .send_delinquency_alert_with_health(
+                                        // Determine if this is a backup node (low-priority alert)
+                                        let is_backup = active_node.label.to_lowercase().contains("backup");
+                                        let alert_priority = if is_backup { "LOW-PRIORITY" } else { "HIGH-PRIORITY" };
+
+                                        // Send appropriate alert based on node type
+                                        let alert_result = if is_backup {
+                                            // Send low-priority alert for backup node delinquency
+                                            alert_mgr.send_backup_delinquency_alert(
+                                                &app_state.validator_statuses[idx]
+                                                    .validator_pair
+                                                    .identity_pubkey,
+                                                &active_node.label,
+                                                new_slot,
+                                                seconds_since_vote,
+                                            ).await
+                                        } else {
+                                            // Send high-priority alert for primary node delinquency with health details
+                                            alert_mgr.send_delinquency_alert_with_health(
                                                 &app_state.validator_statuses[idx]
                                                     .validator_pair
                                                     .identity_pubkey,
@@ -957,14 +1348,15 @@ impl EnhancedStatusApp {
                                                 new_slot,
                                                 seconds_since_vote,
                                                 &node_health,
-                                            )
-                                            .await
-                                        {
+                                            ).await
+                                        };
+
+                                        if let Err(e) = alert_result {
                                             let _ = log_sender.send(LogMessage {
                                                 host: format!("validator-{}", idx),
                                                 message: format!(
-                                                    "Failed to send delinquency alert: {}",
-                                                    e
+                                                    "Failed to send {} delinquency alert: {}",
+                                                    alert_priority, e
                                                 ),
                                                 timestamp: Instant::now(),
                                                 level: LogLevel::Error,
@@ -972,7 +1364,7 @@ impl EnhancedStatusApp {
                                         } else {
                                             let _ = log_sender.send(LogMessage {
                                                 host: format!("validator-{}", idx),
-                                                message: format!("Delinquency alert sent: {} seconds without vote", seconds_since_vote),
+                                                message: format!("{} delinquency alert sent: {} seconds without vote", alert_priority, seconds_since_vote),
                                                 timestamp: Instant::now(),
                                                 level: LogLevel::Warning,
                                             });
@@ -1406,42 +1798,63 @@ impl EnhancedStatusApp {
                                     }
 
                                     // Update health tracking and check if alert needed
-                                    let (should_alert_ssh, consecutive_failures, seconds_since_first) = {
+                                    // Record SSH failure with immediate logging
+                                    let (should_alert_ssh, consecutive_failures, seconds_since_first, node_label) = {
                                         let mut state = ui_state.write().await;
                                         state.validator_health[idx].ssh_status.record_failure(e.to_string());
 
                                         let tracker = &state.validator_health[idx].ssh_status;
                                         let consecutive = tracker.consecutive_failures;
                                         let seconds = tracker.seconds_since_first_failure().unwrap_or(0);
+                                        let label = node_0.node.label.clone();
+
+                                        // Determine alert threshold based on node type
+                                        // Backup nodes: use lower threshold (5 minutes) for faster alerts
+                                        // Primary nodes: use standard threshold (30 minutes)
+                                        let is_backup = label.to_lowercase().contains("backup");
+                                        let time_threshold = if is_backup { 300 } else { 1800 }; // 5 min vs 30 min
 
                                         let config = app_state.config.alert_config.as_ref();
-                                        let time_threshold = config.map(|c| c.ssh_failure_threshold_seconds).unwrap_or(1800);
+                                        let config_threshold = config.map(|c| c.ssh_failure_threshold_seconds).unwrap_or(1800);
+                                        let effective_threshold = if is_backup { 
+                                            time_threshold.min(config_threshold) 
+                                        } else { 
+                                            config_threshold 
+                                        };
 
-                                        let should_alert = seconds >= time_threshold
+                                        let should_alert = seconds >= effective_threshold
                                             && alert_tracker.ssh_failure_tracker[0].should_send_alert(idx);
 
-                                        (should_alert, consecutive, seconds)
+                                        (should_alert, consecutive, seconds, label)
                                     };
 
-                                    // Send SSH failure alert if needed
+                                    // Log immediate SSH failure info (before threshold)
+                                    let _ = log_sender.send(LogMessage {
+                                        host: node_label.clone(),
+                                        message: format!("SSH health check failed: {} (consecutive: {}, duration: {}s)", e, consecutive_failures, seconds_since_first),
+                                        timestamp: Instant::now(),
+                                        level: LogLevel::Error,
+                                    });
+
+                                    // Send SSH failure alert if needed (low-priority)
                                     if should_alert_ssh {
                                         if let Some(alert_mgr) = alert_manager.as_ref() {
-                                            let _ = alert_mgr.send_ssh_failure_alert(
+                                            let _ = alert_mgr.send_ssh_failure_alert_low_priority(
                                                 &validator_status.validator_pair.identity_pubkey,
-                                                &node_0.node.label,
+                                                &node_label,
                                                 consecutive_failures,
                                                 seconds_since_first,
                                                 &e.to_string()
                                             ).await;
                                         }
-                                    }
 
-                                    let _ = log_sender.send(LogMessage {
-                                        host: node_0.node.label.clone(),
-                                        message: format!("SSH health check failed: {}", e),
-                                        timestamp: Instant::now(),
-                                        level: LogLevel::Error,
-                                    });
+                                        let _ = log_sender.send(LogMessage {
+                                            host: node_label.clone(),
+                                            message: format!("SSH failure alert sent: {} consecutive failures over {} seconds", consecutive_failures, seconds_since_first),
+                                            timestamp: Instant::now(),
+                                            level: LogLevel::Warning,
+                                        });
+                                    }
                                 }
                             }
                         }
@@ -1454,10 +1867,30 @@ impl EnhancedStatusApp {
                             match ssh_pool
                                 .execute_command(&node_1.node, ssh_key, "true")
                                 .await
-                            {
-                                Ok(_) => {
-                                    node_pair.node_1.is_healthy = true;
-                                    node_pair.node_1.last_success = Some(Instant::now());
+                            }
+
+                            // Log if delinquency would be suppressed due to SSH/RPC issues
+                            if seconds_since_vote >= threshold {
+                                if state.validator_health[idx].ssh_status.consecutive_failures > 0 {
+                                    let _ = log_sender.send(LogMessage {
+                                        host: format!("validator-{}", idx),
+                                        message: format!("Delinquency alert SUPPRESSED: SSH is failing (delinquent for {}s, SSH failures: {})", seconds_since_vote, state.validator_health[idx].ssh_status.consecutive_failures),
+                                        timestamp: Instant::now(),
+                                        level: LogLevel::Warning,
+                                    });
+                                }
+                                if state.validator_health[idx].rpc_status.consecutive_failures > 0 {
+                                    let _ = log_sender.send(LogMessage {
+                                        host: format!("validator-{}", idx),
+                                        message: format!("Delinquency alert SUPPRESSED: RPC is failing (delinquent for {}s, RPC failures: {})", seconds_since_vote, state.validator_health[idx].rpc_status.consecutive_failures),
+                                        timestamp: Instant::now(),
+                                        level: LogLevel::Warning,
+                                    });
+                                }
+                            }
+
+                    // Check node 1
+                    if validator_status.nodes_with_status.len() > 1 {
                                     node_pair.node_1.failure_start = None;
 
                                     let _ = log_sender.send(LogMessage {
@@ -1956,15 +2389,16 @@ pub async fn run_enhanced_ui(app: &mut EnhancedStatusApp) -> Result<bool> {
         while let Ok(action) = action_rx.try_recv() {
             _last_action_time = Instant::now();
 
-            process_ui_action(
-                action,
-                &app.ui_state,
-                &app.should_quit,
-                &app.view_state,
-                &app.app_state,
-                &app.switch_confirmed,
-            )
-            .await?;
+                process_ui_action(
+                    action,
+                    &app.ui_state,
+                    &app.should_quit,
+                    &app.view_state,
+                    &app.app_state,
+                    &app.switch_confirmed,
+                    &app.log_sender,
+                )
+                .await?;
         }
 
         // Check for quit signal with timeout to prevent blocking
@@ -3414,7 +3848,7 @@ fn draw_switch_ui(f: &mut ratatui::Frame, app_state: &AppState, ui_state: &UiSta
             Line::from("Actions that will be performed:")
                 .style(Style::default().add_modifier(Modifier::BOLD)),
             Line::from("  1. Switch active node to unfunded identity"),
-            Line::from("  2. Transfer tower file to standby node"),
+            Line::from("  2. Delete tower file on standby node"),
             Line::from("  3. Switch standby node to funded identity"),
             Line::from(""),
             Line::from("[!] Press 'y' to confirm switch or 'q' to cancel")
@@ -3507,7 +3941,11 @@ fn shorten_path(path: &str, max_len: usize) -> String {
 }
 
 /// Refresh all fields for all validators
-async fn refresh_all_fields(app_state: Arc<AppState>, ui_state: Arc<RwLock<UiState>>) {
+async fn refresh_all_fields(
+    app_state: Arc<AppState>,
+    ui_state: Arc<RwLock<UiState>>,
+    log_sender: tokio::sync::mpsc::UnboundedSender<LogMessage>,
+) {
     // Get validator count from UI state
     let validator_count = {
         let ui_state_read = ui_state.read().await;
@@ -3520,8 +3958,15 @@ async fn refresh_all_fields(app_state: Arc<AppState>, ui_state: Arc<RwLock<UiSta
         let app_state_clone = app_state.clone();
         let ui_state_clone = ui_state.clone();
 
+        let log_sender_clone = log_sender.clone();
         let handle = tokio::spawn(async move {
-            refresh_validator_fields(validator_idx, app_state_clone, ui_state_clone).await;
+            refresh_validator_fields(
+                validator_idx,
+                app_state_clone,
+                ui_state_clone,
+                log_sender_clone,
+            )
+            .await;
         });
         refresh_handles.push(handle);
     }
@@ -3543,6 +3988,7 @@ async fn refresh_validator_fields(
     validator_idx: usize,
     app_state: Arc<AppState>,
     ui_state: Arc<RwLock<UiState>>,
+    log_sender: tokio::sync::mpsc::UnboundedSender<LogMessage>,
 ) {
     // Get validator data from UI state
     let (validator_pair, nodes) = {
@@ -3636,6 +4082,7 @@ async fn refresh_validator_fields(
         let ssh_pool_clone = ssh_pool.clone();
         let ssh_key_clone = ssh_key.clone();
 
+        let log_sender_clone = log_sender.clone();
         tokio::spawn(async move {
             refresh_rpc_health(
                 validator_idx,
@@ -3644,6 +4091,7 @@ async fn refresh_validator_fields(
                 ssh_pool_clone,
                 ssh_key_clone,
                 ui_state_clone,
+                log_sender_clone,
             )
             .await;
         });
@@ -3716,6 +4164,7 @@ async fn refresh_rpc_health(
     ssh_pool: Arc<crate::ssh::AsyncSshPool>,
     ssh_key: String,
     ui_state: Arc<RwLock<UiState>>,
+    log_sender: tokio::sync::mpsc::UnboundedSender<LogMessage>,
 ) {
     use crate::validator_rpc::{get_health, get_rpc_port};
 
@@ -3743,6 +4192,34 @@ async fn refresh_rpc_health(
         rpc_status.last_check = Some(Instant::now());
         rpc_status.error_message = error_msg;
     }
+
+    // Log the RPC health result for primary/backup identification
+    let role = if node.status == crate::types::NodeStatus::Active {
+        "primary"
+    } else {
+        "backup"
+    };
+
+    let message = if let Some(ref e) = error_msg {
+        format!("[{}] RPC health: unhealthy - {}", role, e)
+    } else if is_healthy {
+        format!("[{}] RPC health: healthy", role)
+    } else {
+        format!("[{}] RPC health: unhealthy", role)
+    };
+
+    let level = if is_healthy {
+        LogLevel::Info
+    } else {
+        LogLevel::Warning
+    };
+
+    let _ = log_sender.send(LogMessage {
+        host: node.node.label.clone(),
+        message,
+        timestamp: Instant::now(),
+        level,
+    });
 
     // Clear the refresh flag
     if let Some(refresh_state) = state.field_refresh_states.get_mut(validator_idx) {

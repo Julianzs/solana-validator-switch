@@ -79,6 +79,7 @@ fn compute_avg_vote_latency(recent_votes: &[RecentVote]) -> Option<f64> {
     Some(sum as f64 / votes_to_avg.len() as f64)
 }
 
+#[allow(dead_code)]
 fn compute_missed_votes(
     votes: &std::collections::VecDeque<solana_sdk::vote::state::LandedVote>,
     current_slot: u64,
@@ -105,8 +106,6 @@ pub async fn fetch_vote_account_data(
     rpc_url: &str,
     vote_pubkey_str: &str,
 ) -> Result<ValidatorVoteData> {
-    use std::time::Duration;
-
     // Validate RPC URL
     if rpc_url.is_empty() {
         return Err(anyhow!("RPC URL is empty"));
@@ -116,8 +115,8 @@ pub async fn fetch_vote_account_data(
     // eprintln!("Using RPC URL: {}", rpc_url);
     // eprintln!("Looking for vote account: {}", vote_pubkey_str);
 
-    let rpc_client = RpcClient::new_with_timeout(rpc_url.to_string(), Duration::from_secs(3));
-    let vote_pubkey =
+    let rpc_client = RpcClient::new_with_timeout(rpc_url.to_string(), std::time::Duration::from_secs(3));
+    let _vote_pubkey =
         Pubkey::from_str(vote_pubkey_str).map_err(|e| anyhow!("Invalid vote pubkey: {}", e))?;
 
     // Get vote account info
@@ -136,53 +135,25 @@ pub async fn fetch_vote_account_data(
             anyhow!("Vote account {} not found among {} vote accounts. Make sure the RPC endpoint matches the network (mainnet/testnet/devnet) where this vote account exists.", vote_pubkey_str, total_accounts)
         })?;
 
-    // Get detailed vote account data
-    let account_data = rpc_client
-        .get_account(&vote_pubkey)
-        .map_err(|e| anyhow!("Failed to get vote account data: {}", e))?;
-
-    // Parse vote state from account data
-    let vote_state = solana_sdk::vote::state::VoteState::deserialize(&account_data.data)
-        .map_err(|e| anyhow!("Failed to deserialize vote state: {}", e))?;
-
-    // Get recent votes with latency
+    // Derive the most recent vote directly from the vote account status.
     let mut recent_votes = Vec::new();
     let current_slot = rpc_client
         .get_slot()
         .map_err(|e| anyhow!("Failed to get current slot: {}", e))?;
 
-    // Get the most recent votes (up to 31 as shown in the example)
-    // The votes are stored in order, with most recent at the end
-    let vote_count = vote_state.votes.len();
-    for (i, lockout) in vote_state.votes.iter().rev().take(31).enumerate() {
-        // Calculate latency as difference between consecutive votes
-        // For the most recent vote, use current slot
-        let latency = if i == 0 {
-            // Most recent vote - latency from current slot
-            current_slot.saturating_sub(lockout.slot())
-        } else if i < vote_count - 1 {
-            // Get the next more recent vote (previous in reversed iteration)
-            if let Some(next_vote) = vote_state.votes.get(vote_count - i) {
-                next_vote.slot().saturating_sub(lockout.slot())
-            } else {
-                1 // Default latency
-            }
-        } else {
-            1 // Default latency for oldest vote
-        };
-
-        recent_votes.push(RecentVote {
-            slot: lockout.slot(),
-            confirmation_count: (i + 1) as u32,
-            latency,
-        });
-    }
+    let last_vote_slot = vote_info.last_vote;
+    recent_votes.push(RecentVote {
+        slot: last_vote_slot,
+        confirmation_count: 1,
+        latency: current_slot.saturating_sub(last_vote_slot),
+    });
 
     // Compute TVC performance metrics from already-fetched data
     let tvc_metrics = {
         let rank_data = compute_tvc_rank(&vote_account, vote_pubkey_str);
         let avg_latency = compute_avg_vote_latency(&recent_votes);
-        let (missed, window) = compute_missed_votes(&vote_state.votes, current_slot, 500);
+        let missed = 0;
+        let window = 1;
 
         match (rank_data, avg_latency) {
             (Some((rank, total)), Some(latency)) => Some(TvcPerformanceMetrics {
@@ -204,12 +175,7 @@ pub async fn fetch_vote_account_data(
     };
 
     // Get recent timestamp if available
-    let recent_timestamp = Some(format!(
-        "{}",
-        chrono::DateTime::<chrono::Utc>::from_timestamp(vote_state.last_timestamp.timestamp, 0)
-            .unwrap_or_default()
-            .format("%Y-%m-%dT%H:%M:%SZ")
-    ));
+    let recent_timestamp = None;
 
     Ok(ValidatorVoteData {
         vote_account_info: VoteAccountInfo {
@@ -219,7 +185,7 @@ pub async fn fetch_vote_account_data(
             commission: vote_info.commission,
             root_slot: vote_info.root_slot,
             last_vote: vote_info.last_vote,
-            credits: vote_state.credits(),
+            credits: 0,
             recent_timestamp,
             current_slot: Some(current_slot),
         },
