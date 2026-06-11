@@ -927,7 +927,19 @@ async fn refresh_vote_data_for_alerts(
                         .map(|c| c.enabled && c.auto_failover_enabled)
                         .unwrap_or(false);
 
-                    if auto_failover_enabled && vote_rpc_failures == 0 {
+                    // Concurrent-spawn guard. A real failover runs for
+                    // ~30-40s end-to-end; without this load the next
+                    // poll tick (every ~10-20s) would `tokio::spawn` a
+                    // second `execute_emergency_failover` while the
+                    // first is still in flight, racing two takeovers
+                    // against each other. The 15-min alert cooldown
+                    // was the indirect guard previously, which is
+                    // brittle: a future cooldown change would silently
+                    // re-introduce the race.
+                    let already_in_progress =
+                        emergency_takeover_flag.load(Ordering::Acquire);
+
+                    if !already_in_progress && auto_failover_enabled && vote_rpc_failures == 0 {
                         if sim_idx == Some(idx) {
                             // Simulation dry-run: the gate evaluated to true,
                             // but we do NOT spawn the real failover. The
@@ -986,6 +998,20 @@ async fn refresh_vote_data_for_alerts(
                                 .await;
                             });
                         }
+                    } else if already_in_progress && auto_failover_enabled && vote_rpc_failures == 0 {
+                        // Distinguishes "gate did not fire" from "gate
+                        // fired but spawn was suppressed" in the log.
+                        // Only logs when the gate would otherwise have
+                        // fired (auto_failover_enabled && vote_rpc_failures == 0),
+                        // not on every poll tick.
+                        let _ = log_sender.send(LogMessage {
+                            host: host_for_log.clone(),
+                            message:
+                                "Auto-failover spawn skipped: previous emergency takeover still in progress"
+                                    .to_string(),
+                            timestamp: Instant::now(),
+                            level: LogLevel::Info,
+                        });
                     }
                 }
             }

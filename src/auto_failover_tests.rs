@@ -314,5 +314,32 @@ mod tests {
              `write_lock_with_timeout(&ui_state, 500).await` with a Warning \
              log on the Err arm is the correct pattern."
         );
+
+        // ── Concurrent-spawn guard at the auto-failover spawn site ──
+        //
+        // A real failover runs for ~30-40s end-to-end while the poll
+        // tick fires every ~10-20s, so without an explicit
+        // `emergency_takeover_flag.load(...)` before the
+        // `tokio::spawn(execute_emergency_failover(...))` call site,
+        // the next tick can spawn a second failover that races the
+        // first. The 15-min alert cooldown was the indirect guard
+        // previously, which is brittle: changing the cooldown would
+        // silently re-introduce the race.
+        assert!(
+            src.contains("emergency_takeover_flag.load("),
+            "Expected `emergency_takeover_flag.load(...)` in status_ui_v2.rs \
+             at the auto-failover spawn site. Without an explicit load before \
+             the spawn, a second `tokio::spawn(execute_emergency_failover)` \
+             can race an in-flight takeover."
+        );
+        assert!(
+            src.contains(
+                "Auto-failover spawn skipped: previous emergency takeover still in progress"
+            ),
+            "Expected the `Auto-failover spawn skipped: ...` Info-level log \
+             marker at the auto-failover spawn site. Without this log line \
+             the operator cannot distinguish `gate did not fire` from `gate \
+             fired but spawn was suppressed`."
+        );
     }
 }
