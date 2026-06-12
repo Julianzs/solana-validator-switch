@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.1.1] - 2026-06-11
+
+### Fixed
+- **Auto-failover trigger restored**: the trigger inadvertently removed during the
+  2.1.0 cleanup pass is reinstated, so HIGH-PRIORITY delinquency once again spawns
+  `execute_emergency_failover` when `auto_failover_enabled && vote_rpc_failures == 0`
+- **Telegram entity-parse failure**: dropped `parse_mode: "Markdown"` from the
+  `sendMessage` payload; validator labels containing unescaped Markdown
+  metacharacters (`_`, `*`, `` ` ``, `[`) no longer cause silent alert drops,
+  including HIGH-PRIORITY delinquency alerts that gate auto-failover operator
+  visibility
+- **Concurrent failover spawn**: the auto-failover spawn site now checks
+  `emergency_takeover_in_progress` before spawning `execute_emergency_failover`
+  and emits an Info-level `"Auto-failover spawn skipped: previous emergency
+  takeover still in progress"` log line when a prior takeover is still running,
+  preventing a second `tokio::spawn` from racing the in-flight one
+
+### Changed
+- **Background-task storage**: `Arc<RwLock<Vec<JoinHandle>>>` migrated to
+  `Arc<std::sync::Mutex<JoinSet>>` (`JoinSet` auto-aborts on drop, structurally
+  preventing the dup-cycle bug where re-invocations of `spawn_background_tasks`
+  could leave previous tasks running alongside the new ones). Boolean signaling
+  flags (`should_quit`, `emergency_takeover_in_progress`, `switch_confirmed`)
+  migrated from `Arc<RwLock<bool>>` to `Arc<AtomicBool>` (wait-free, eliminates
+  silent-drop under lock contention)
+
+### Added
+- **`SVS_SIMULATE_FAILOVER=<idx>` env var**: env-var-gated simulation that emits
+  a `🚨 SIMULATION DRY-RUN: ...` log marker on every poll tick without spawning
+  the real failover, allowing non-destructive end-to-end verification of the
+  auto-failover gate logic
+
 ## [2.1.0] - 2026-05-25
 
 ### Added
