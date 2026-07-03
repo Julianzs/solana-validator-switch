@@ -29,6 +29,8 @@ mod executable_utils;
 mod solana_rpc;
 mod ssh;
 mod ssh_key_detector;
+#[cfg(test)]
+mod ssh_pool_tests;
 mod startup;
 mod startup_checks;
 mod startup_logger;
