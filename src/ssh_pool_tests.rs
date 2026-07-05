@@ -57,4 +57,23 @@ mod tests {
             "RPC curl must pass an explicit -m (max-time) timeout"
         );
     }
+
+    /// Shell detection must prefer bash over PowerShell. These validators are
+    /// Linux; a node with pwsh installed but broken (crashes on every spawn)
+    /// must not be driven via pwsh, which surfaces as "the remote process has
+    /// terminated" for every command and blinds node monitoring.
+    #[test]
+    fn test_shell_detection_prefers_bash() {
+        let src = include_str!("ssh.rs");
+        let bash_at = src
+            .find("svs_bash_ok")
+            .expect("detect_remote_shell must probe bash first");
+        let pwsh_at = src
+            .find("PSVersionTable")
+            .expect("PowerShell fallback must remain for Windows hosts");
+        assert!(
+            bash_at < pwsh_at,
+            "detect_remote_shell must try bash before falling back to PowerShell"
+        );
+    }
 }

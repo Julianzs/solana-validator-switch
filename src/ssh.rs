@@ -68,9 +68,31 @@ impl AsyncSshPool {
             || command.contains("2>&1")
     }
 
-    /// Detect the remote shell type (PowerShell vs bash)
+    /// Detect the remote shell type, preferring bash whenever it works.
     async fn detect_remote_shell(&self, session: &Session) -> Result<RemoteShellType> {
-        // Try pwsh (PowerShell Core) detection first - this is what's common on Linux
+        // Prefer bash whenever the node has a working one. These validators run
+        // Linux, where bash is the correct, reliable shell. PowerShell (pwsh)
+        // may also be installed, but it is not a safe default: e.g. a broken
+        // pwsh/.NET install aborts on every invocation, which surfaces as
+        // "the remote process has terminated" for every SSH command and takes
+        // node health + swap-readiness monitoring down while the box is fine.
+        // Only fall back to PowerShell for genuine Windows hosts (no bash).
+        let bash_test = session
+            .command("bash")
+            .arg("-c")
+            .arg("echo svs_bash_ok")
+            .output()
+            .await;
+
+        if let Ok(output) = bash_test {
+            if output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains("svs_bash_ok")
+            {
+                return Ok(RemoteShellType::Bash);
+            }
+        }
+
+        // No usable bash - try PowerShell Core, then Windows PowerShell.
         let pwsh_test = session
             .command("pwsh")
             .arg("-Command")
