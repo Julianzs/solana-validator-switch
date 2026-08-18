@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use tokio::time::timeout;
 
 use crate::alert::AlertManager;
-use crate::commands::switch::SwitchManager;
+use crate::commands::switch::{FailoverMode, SwitchManager};
 use crate::ssh::AsyncSshPool;
 use crate::types::{NodeWithStatus, ValidatorPair};
 
@@ -20,6 +20,7 @@ pub struct EmergencyFailover {
     tower_copy_success: bool,
     standby_switch_success: bool,
     total_time: Option<Duration>,
+    mode: FailoverMode,
 }
 
 impl EmergencyFailover {
@@ -30,6 +31,7 @@ impl EmergencyFailover {
         ssh_pool: Arc<AsyncSshPool>,
         detected_ssh_keys: std::collections::HashMap<String, String>,
         alert_manager: AlertManager,
+        mode: FailoverMode,
     ) -> Self {
         Self {
             active_node,
@@ -42,6 +44,7 @@ impl EmergencyFailover {
             tower_copy_success: false,
             standby_switch_success: false,
             total_time: None,
+            mode,
         }
     }
 
@@ -64,12 +67,13 @@ impl EmergencyFailover {
             self.detected_ssh_keys.clone(),
         );
 
-        // Step 1: Try to switch primary to unfunded (optional, best-effort)
-        eprintln!("📤 Switching primary to unfunded...");
         std::env::set_var("SVS_SILENT_MODE", "1");
+        let plan = self.mode.step_plan();
 
+        if plan.demote_source {
+            eprintln!("📤 Switching primary to unfunded...");
         let primary_result = match timeout(
-            Duration::from_secs(10), // Default 10 second timeout
+                Duration::from_secs(10),
             switch_manager.switch_primary_to_unfunded(false),
         )
         .await
@@ -88,11 +92,16 @@ impl EmergencyFailover {
             }
         };
         self.primary_switch_success = primary_result.is_ok();
+        } else {
+            eprintln!(
+                "   ⚠️  Primary is unreachable and confirmed delinquent; skipping primary demotion"
+            );
+        }
 
-        // Step 2: Try to copy tower file (optional, best-effort)
+        if plan.transfer_tower {
         eprintln!("📤 Copying tower file...");
         let tower_result = match timeout(
-            Duration::from_secs(10), // Default 10 second timeout
+                Duration::from_secs(10),
             switch_manager.transfer_tower_file(false),
         )
         .await
@@ -111,8 +120,12 @@ impl EmergencyFailover {
             }
         };
         self.tower_copy_success = tower_result.is_ok();
+        } else {
+            eprintln!("   ⚠️  Tower copy skipped because the primary is unreachable");
+        }
 
-        // Step 3: Switch standby to funded (REQUIRED - must succeed)
+        // Standby promotion is required in every mode.
+        debug_assert!(plan.promote_standby);
         eprintln!("🚀 Switching standby to funded identity...");
         match switch_manager.switch_backup_to_funded(false).await {
             Ok(_) => {

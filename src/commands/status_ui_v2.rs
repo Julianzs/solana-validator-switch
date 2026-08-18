@@ -979,6 +979,10 @@ async fn refresh_vote_data_for_alerts(
                                 level: LogLevel::Error,
                             });
 
+                            // Claim the in-progress flag before spawning so a
+                            // second poll tick cannot race the pre-warm phase.
+                            emergency_takeover_flag.store(true, Ordering::Release);
+
                             let validator_status_for_failover =
                                 app_state.validator_statuses[idx].clone();
                             let ssh_pool_for_failover = app_state.ssh_pool.clone();
@@ -1257,6 +1261,24 @@ pub struct EnhancedStatusApp {
 /// visible to a debugger and to source-code search, and so future
 /// readers can see the supervision discipline without having to know
 /// the implicit `Drop for JoinSet` semantics.
+async fn shutdown_join_set(
+    background_tasks: &Arc<std::sync::Mutex<tokio::task::JoinSet<()>>>,
+) {
+    let mut tasks = {
+        let mut guard = background_tasks
+            .lock()
+            .expect("background_tasks Mutex poisoned");
+        std::mem::take(&mut *guard)
+    };
+    tasks.shutdown().await;
+}
+
+impl EnhancedStatusApp {
+    async fn shutdown_background_tasks(&self) {
+        shutdown_join_set(&self.background_tasks).await;
+    }
+}
+
 impl Drop for EnhancedStatusApp {
     fn drop(&mut self) {
         // Acquire the sync Mutex non-blockingly: if a concurrent
@@ -3620,6 +3642,14 @@ fn draw_footer(f: &mut ratatui::Frame, area: Rect, ui_state: &UiState, app_state
     f.render_widget(footer, area);
 }
 
+struct EmergencyTakeoverFlagGuard(Arc<AtomicBool>);
+
+impl Drop for EmergencyTakeoverFlagGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 /// Execute emergency failover for a validator.
 ///
 /// Called from `refresh_vote_data_for_alerts` when the auto-failover gate
@@ -3641,6 +3671,10 @@ async fn execute_emergency_failover(
     detected_ssh_keys: std::collections::HashMap<String, String>,
     emergency_takeover_flag: Arc<AtomicBool>,
 ) {
+    // The caller claims the flag before spawning. This guard clears it on
+    // every return path, including standby pre-warm failures.
+    let _flag_guard = EmergencyTakeoverFlagGuard(emergency_takeover_flag);
+
     // Find active and standby nodes
     let (active_node, standby_node) = match (
         validator_status
@@ -3659,35 +3693,54 @@ async fn execute_emergency_failover(
         }
     };
 
-    // Pre-warm the SSH session to the primary. The 10-second periodic SSH
-    // ping against the primary has been disabled to reduce load on the
-    // production node, so the cached SSH session may have gone idle and the
-    // OpenSSH controlmaster may have dropped it. Establishing the session
-    // here keeps the connection-setup cost off the critical failover path.
-    //
-    // If pre-warm fails we surface it loudly and abort BEFORE any state
-    // changes. The downstream `set-identity --unfunded` would fail anyway,
-    // but the operator-facing error would be a generic "failed to execute
-    // command" rather than the actionable "primary is unreachable, failover
-    // not attempted."
-    if let Some(ssh_key) = detected_ssh_keys.get(&active_node.node.host) {
-        if let Err(e) = ssh_pool.get_session(&active_node.node, ssh_key).await {
+    // The standby is the only hard SSH dependency in a disaster takeover.
+    // If it cannot be reached there is nowhere safe to promote, so abort.
+    let standby_ssh_key = match detected_ssh_keys.get(&standby_node.node.host) {
+        Some(key) => key,
+        None => {
             eprintln!(
-                "❌ Emergency failover pre-warm failed for {}: {}. Aborting failover before any state change.",
-                active_node.node.host, e
+                "❌ Emergency failover: no SSH key detected for standby host {}. Aborting before any state change.",
+                standby_node.node.host
             );
             return;
         }
-    } else {
+    };
+    if let Err(error) = ssh_pool
+        .get_session(&standby_node.node, standby_ssh_key)
+        .await
+    {
         eprintln!(
-            "❌ Emergency failover: no SSH key detected for primary host {}. Aborting before any state change.",
-            active_node.node.host
+            "❌ Emergency failover standby pre-warm failed for {}: {}. Aborting before any state change.",
+            standby_node.node.host, error
         );
         return;
     }
 
-    // Set the emergency takeover flag to suspend UI rendering
-    emergency_takeover_flag.store(true, Ordering::Release);
+    // Source reachability selects graceful vs degraded execution. The caller
+    // reached this function only after healthy cluster RPC confirmed vote
+    // delinquency, so an unreachable source is expected during a reboot and
+    // must not block standby promotion.
+    let source_reachable = match detected_ssh_keys.get(&active_node.node.host) {
+        Some(key) => match ssh_pool.get_session(&active_node.node, key).await {
+            Ok(_) => true,
+            Err(error) => {
+                eprintln!(
+                    "⚠️  Primary pre-warm failed for {}: {}. Continuing degraded takeover without source demotion or tower copy.",
+                    active_node.node.host, error
+                );
+                false
+            }
+        },
+        None => {
+            eprintln!(
+                "⚠️  No SSH key detected for primary host {}. Continuing degraded takeover without source demotion or tower copy.",
+                active_node.node.host
+            );
+            false
+        }
+    };
+    let failover_mode =
+        crate::commands::switch::FailoverMode::for_confirmed_delinquency(source_reachable);
 
     // Wait a moment for the UI to stop rendering and cleanup terminal
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -3699,6 +3752,7 @@ async fn execute_emergency_failover(
         ssh_pool,
         detected_ssh_keys,
         alert_manager,
+        failover_mode,
     );
 
     if let Err(e) = emergency_failover.execute_emergency_takeover().await {
@@ -3708,8 +3762,7 @@ async fn execute_emergency_failover(
     // Wait a moment for the user to see the results
     tokio::time::sleep(Duration::from_secs(3)).await;
 
-    // Clear the emergency takeover flag to resume UI
-    emergency_takeover_flag.store(false, Ordering::Release);
+    // The flag guard resumes the UI on return.
 }
 
 /// Draw the switch UI
@@ -4939,6 +4992,21 @@ async fn refresh_swap_readiness(
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum SwitchAttemptOutcome {
+    Completed,
+    NotCompleted,
+    Failed(String),
+}
+
+fn classify_switch_attempt(result: Result<bool>) -> SwitchAttemptOutcome {
+    match result {
+        Ok(true) => SwitchAttemptOutcome::Completed,
+        Ok(false) => SwitchAttemptOutcome::NotCompleted,
+        Err(error) => SwitchAttemptOutcome::Failed(error.to_string()),
+    }
+}
+
 pub async fn show_enhanced_status_ui(app_state: &AppState) -> Result<()> {
     // Clear any startup output before starting the TUI
     print!("\x1B[2J\x1B[1;1H"); // Clear screen and move cursor to top
@@ -4955,6 +5023,9 @@ pub async fn show_enhanced_status_ui(app_state: &AppState) -> Result<()> {
         let app_state_arc = Arc::new(current_app_state.clone());
         let mut app = EnhancedStatusApp::new(app_state_arc.clone()).await?;
         let switch_confirmed = run_enhanced_ui(&mut app).await?;
+        // Stop and join monitor loops before changing identities. This keeps
+        // timer/SSH futures from being polled while an error unwinds the app.
+        app.shutdown_background_tasks().await;
 
         if !switch_confirmed {
             // User quit without requesting a switch - exit the loop
@@ -4974,31 +5045,81 @@ pub async fn show_enhanced_status_ui(app_state: &AppState) -> Result<()> {
             current_app_state.selected_validator_index = ui_state_guard.selected_validator_index;
         }
 
-        let result = crate::commands::switch::switch_command_with_confirmation(
+        let outcome = classify_switch_attempt(
+            crate::commands::switch::switch_command_with_confirmation(
             false, // not a dry run
             &mut current_app_state,
             false, // don't require confirmation again
         )
-        .await?;
+            .await,
+        );
 
-        if result {
+        match outcome {
+            SwitchAttemptOutcome::Completed => {
             println!("\n✅ Switch completed successfully!");
             println!("📊 Returning to validator status view...\n");
-
-            // Wait a moment for the switch to take effect
             tokio::time::sleep(Duration::from_secs(2)).await;
-
-            // The loop will restart the UI with the updated current_app_state
-            // which now has the swapped Active/Standby statuses
-        } else {
+            }
+            SwitchAttemptOutcome::NotCompleted => {
             println!("\n❌ Switch was not completed");
-            // Still restart the UI to let user try again or quit
+            }
+            SwitchAttemptOutcome::Failed(error) => {
+                eprintln!("\n❌ Switch failed: {}", error);
+                println!("📊 Returning to validator status view...\n");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
         }
     }
 
     Ok(())
 }
 
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::{classify_switch_attempt, shutdown_join_set, SwitchAttemptOutcome};
+    use anyhow::anyhow;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn shutdown_cancels_and_joins_sleeping_monitor_tasks() {
+        let completed = Arc::new(AtomicBool::new(false));
+        let tasks = Arc::new(Mutex::new(tokio::task::JoinSet::new()));
+        {
+            let mut guard = tasks.lock().unwrap();
+            let completed = Arc::clone(&completed);
+            guard.spawn(async move {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                completed.store(true, Ordering::Release);
+            });
+        }
+
+        tokio::time::timeout(Duration::from_secs(1), shutdown_join_set(&tasks))
+            .await
+            .expect("monitor shutdown should not hang");
+
+        assert!(!completed.load(Ordering::Acquire));
+        assert!(tasks.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn switch_error_is_classified_for_tui_recovery_instead_of_propagation() {
+        assert_eq!(
+            classify_switch_attempt(Err(anyhow!("tower missing"))),
+            SwitchAttemptOutcome::Failed("tower missing".to_string())
+        );
+        assert_eq!(
+            classify_switch_attempt(Ok(true)),
+            SwitchAttemptOutcome::Completed
+        );
+        assert_eq!(
+            classify_switch_attempt(Ok(false)),
+            SwitchAttemptOutcome::NotCompleted
+        );
+    }
+}
 
 #[cfg(test)]
 mod throttle_tests {

@@ -57,6 +57,78 @@ fn decode_base64_payload(payload: &str) -> Result<Vec<u8>> {
         .map_err(|e| anyhow!("Failed to decode transferred tower data: {}", e))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FailoverMode {
+    Graceful,
+    DegradedSourceUnavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FailoverStepPlan {
+    pub demote_source: bool,
+    pub transfer_tower: bool,
+    pub promote_standby: bool,
+}
+
+impl FailoverMode {
+    pub(crate) fn for_confirmed_delinquency(source_reachable: bool) -> Self {
+        if source_reachable {
+            Self::Graceful
+        } else {
+            Self::DegradedSourceUnavailable
+        }
+    }
+
+    pub(crate) fn step_plan(self) -> FailoverStepPlan {
+        let source_steps = matches!(self, Self::Graceful);
+        FailoverStepPlan {
+            demote_source: source_steps,
+            transfer_tower: source_steps,
+            promote_standby: true,
+        }
+    }
+
+    fn attempts_source_steps(self) -> bool {
+        self.step_plan().demote_source
+    }
+}
+
+#[derive(Debug)]
+struct TowerUnavailableError(String);
+
+impl std::fmt::Display for TowerUnavailableError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for TowerUnavailableError {}
+
+fn tower_unavailable_error(message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(TowerUnavailableError(message.into()))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TowerFailureAction {
+    ContinueWithoutTower,
+    Abort,
+}
+
+fn tower_failure_action(source_demoted: bool, error: &anyhow::Error) -> TowerFailureAction {
+    if source_demoted && error.downcast_ref::<TowerUnavailableError>().is_some() {
+        TowerFailureAction::ContinueWithoutTower
+    } else {
+        TowerFailureAction::Abort
+    }
+}
+
+fn should_rollback_source_after_tower_failure(
+    source_demoted: bool,
+    action: TowerFailureAction,
+) -> bool {
+    source_demoted && action == TowerFailureAction::Abort
+}
+
 pub async fn switch_command(dry_run: bool, app_state: &mut crate::AppState) -> Result<bool> {
     // Clear screen and ensure clean output after menu selection
     print!("\x1B[2J\x1B[1;1H");
@@ -367,11 +439,8 @@ pub async fn switch_command_with_confirmation(
         app_state.detected_ssh_keys.clone(),
     );
 
-    // Pre-warm SSH connections to both nodes for faster switching
     if !dry_run {
         let spinner = ConditionalSpinner::new("Pre-warming SSH connections...");
-
-        // Get SSH keys for both nodes
         let active_ssh_key = app_state
             .detected_ssh_keys
             .get(&active_node_with_status.node.host)
@@ -381,24 +450,20 @@ pub async fn switch_command_with_confirmation(
             .get(&standby_node_with_status.node.host)
             .ok_or_else(|| anyhow!("No SSH key detected for standby node"))?;
 
-        // Pre-warm both connections (they'll be reused from the pool during switch)
-        {
-            let pool = app_state.ssh_pool.clone();
-            // Trigger connection creation for both nodes
-            let _ = pool
-                .get_session(&active_node_with_status.node, active_ssh_key)
-                .await?;
-            let _ = pool
-                .get_session(&standby_node_with_status.node, standby_ssh_key)
-                .await?;
-        }
-
+        app_state
+            .ssh_pool
+            .get_session(&active_node_with_status.node, active_ssh_key)
+            .await?;
+        app_state
+            .ssh_pool
+            .get_session(&standby_node_with_status.node, standby_ssh_key)
+            .await?;
         spinner.stop_with_message("✅ SSH connections ready");
     }
 
     // Execute the switch process
     let switch_result = switch_manager
-        .execute_switch(dry_run, require_confirmation)
+        .execute_switch_in_mode(dry_run, require_confirmation, FailoverMode::Graceful)
         .await;
 
     // Send Telegram notification for switch result (only for live switches)
@@ -599,7 +664,12 @@ impl SwitchManager {
         crate::executable_utils::extract_firedancer_config_path(&process_info)
     }
 
-    async fn execute_switch(&mut self, dry_run: bool, require_confirmation: bool) -> Result<bool> {
+    async fn execute_switch_in_mode(
+        &mut self,
+        dry_run: bool,
+        require_confirmation: bool,
+        mode: FailoverMode,
+    ) -> Result<bool> {
         // Show confirmation dialog (except for dry run or when explicitly disabled)
         if !dry_run && require_confirmation {
             println!(
@@ -666,7 +736,10 @@ impl SwitchManager {
             self.warmup_backup_connection("the failover").await?;
         }
 
-        // Step 1: Switch active node to unfunded identity
+        let mut source_demoted = false;
+        let primary_offline_start = Instant::now();
+
+        if mode.attempts_source_steps() {
         println_if_not_silent!(
             "\n{}",
             "🔄 Step 1: Switch Active Node to Unfunded Identity"
@@ -674,12 +747,10 @@ impl SwitchManager {
                 .bold()
         );
         let active_switch_start = Instant::now();
-        self.switch_primary_to_unfunded(dry_run).await?;
-        // Track that step 1 completed for potential rollback
-        let step1_completed = true;
+            match self.switch_primary_to_unfunded(dry_run).await {
+                Ok(()) => {
+                    source_demoted = true;
         self.active_switch_time = Some(active_switch_start.elapsed());
-        // Mark primary offline start point (after active node switched to unfunded)
-        let primary_offline_start = Instant::now();
         if !dry_run {
             println_if_not_silent!(
                 "   ✓ Completed in {}",
@@ -688,38 +759,46 @@ impl SwitchManager {
                     .bold()
             );
         }
+                }
+                Err(error) => return Err(error),
+            }
 
-        // Step 2: Transfer tower file (with rollback on failure)
+            if source_demoted {
         println_if_not_silent!(
             "\n{}",
             "📤 Step 2: Transfer Tower File".bright_blue().bold()
         );
-        if let Err(e) = self.transfer_tower_file(dry_run).await {
-            // Step 2 failed - attempt rollback of Step 1
-            if step1_completed && !dry_run {
+                if let Err(error) = self.transfer_tower_file(dry_run).await {
+                    let action = tower_failure_action(source_demoted, &error);
+                    match action {
+                        TowerFailureAction::ContinueWithoutTower => {
                 println_if_not_silent!(
                     "\n{}",
-                    "⚠️  Tower transfer failed! Attempting rollback..."
-                        .bright_red()
+                                "⚠️  Tower transfer unavailable; continuing degraded failover because the active identity is already unfunded."
+                                    .bright_yellow()
                         .bold()
                 );
-                if let Err(rollback_err) = self.rollback_primary_to_funded().await {
-                    // CRITICAL: Both forward and rollback failed
-                    eprintln!(
+                            println_if_not_silent!("   Reason: {}", error);
+                            println_if_not_silent!(
+                                "   The standby will activate without the latest tower and may miss recent vote history."
+                            );
+                        }
+                        TowerFailureAction::Abort => {
+                            if should_rollback_source_after_tower_failure(source_demoted, action)
+                                && !dry_run
+                            {
+                                println_if_not_silent!(
                         "\n{}",
-                        "🚨 CRITICAL: Rollback failed! Validator may be in inconsistent state!"
+                                    "⚠️  Tower transfer failed integrity/safety checks; attempting rollback..."
                             .bright_red()
                             .bold()
                     );
-                    eprintln!("   Original error: {}", e);
-                    eprintln!("   Rollback error: {}", rollback_err);
-                    eprintln!(
-                        "   ⚠️  MANUAL INTERVENTION REQUIRED: Check validator status on both nodes!"
-                    );
+                                if let Err(rollback_error) = self.rollback_primary_to_funded().await
+                                {
                     return Err(anyhow!(
-                        "Switch failed and rollback failed. Original: {}. Rollback: {}",
-                        e,
-                        rollback_err
+                                        "Tower transfer failed and rollback failed. Original: {}. Rollback: {}",
+                                        error,
+                                        rollback_error
                     ));
                 }
                 println_if_not_silent!(
@@ -728,9 +807,19 @@ impl SwitchManager {
                         .bright_green()
                 );
             }
-            return Err(e);
+                            return Err(error);
+                        }
+                    }
+                }
+            }
+        } else {
+            println_if_not_silent!(
+                "\n{}",
+                "⚠️  Degraded takeover: source is unreachable and confirmed delinquent; skipping source demotion and tower transfer."
+                    .bright_yellow()
+                    .bold()
+            );
         }
-        // Note: tower_transfer_time is set inside transfer_tower_file method
 
         // Step 3: Switch standby node to funded identity (with rollback on failure)
         println_if_not_silent!(
@@ -741,9 +830,9 @@ impl SwitchManager {
         );
         let standby_switch_start = Instant::now();
         if let Err(e) = self.switch_backup_to_funded(dry_run).await {
-            // Step 3 failed - attempt rollback of Step 1
-            // Note: Tower file was transferred but that's okay, it can be overwritten later
-            if step1_completed && !dry_run {
+            // If we demoted the source, restore it when target activation fails.
+            // A degraded takeover did not modify the source, so no rollback is possible.
+            if source_demoted && !dry_run {
                 println_if_not_silent!(
                     "\n{}",
                     "⚠️  Standby activation failed! Attempting rollback..."
@@ -1083,26 +1172,39 @@ impl SwitchManager {
             .active_node_with_status
             .tower_path
             .as_ref()
-            .ok_or_else(|| anyhow!("Tower path not available for active node"))?;
+            .ok_or_else(|| tower_unavailable_error("Tower path not available for active node"))?;
 
         // Verify the tower file exists
         let check_tower_cmd = format!("test -f {} && echo 'exists' || echo 'missing'", tower_path);
         let tower_exists = {
-            let ssh_key = self.get_ssh_key_for_node(&self.active_node_with_status.node.host)?;
+            let ssh_key = self
+                .get_ssh_key_for_node(&self.active_node_with_status.node.host)
+                .map_err(|error| {
+                    tower_unavailable_error(format!(
+                        "Cannot access tower on active node: {}",
+                        error
+                    ))
+                })?;
             let pool = self.ssh_pool.clone();
             pool.execute_command(
                 &self.active_node_with_status.node,
                 &ssh_key,
                 &check_tower_cmd,
             )
-            .await?
+            .await
+            .map_err(|error| {
+                tower_unavailable_error(format!(
+                    "Failed to check tower on active node: {}",
+                    error
+                ))
+            })?
         };
 
         if tower_exists.trim() != "exists" {
-            return Err(anyhow!(
+            return Err(tower_unavailable_error(format!(
                 "Tower file not found on active node: {}",
                 tower_path
-            ));
+            )));
         }
 
         let tower_filename = tower_path.split('/').last().unwrap_or("tower.bin");
@@ -1148,7 +1250,10 @@ impl SwitchManager {
                     {
                         Ok(data) => data,
                         Err(e) => {
-                            return Err(anyhow!("Failed to read tower file: {}", e));
+                            return Err(tower_unavailable_error(format!(
+                                "Failed to read tower file from active node: {}",
+                                e
+                            )));
                         }
                     }
                 };
@@ -1470,6 +1575,73 @@ impl SwitchManager {
         } else {
             println_if_not_silent!("✅ Validator identity switch completed successfully");
         }
+    }
+}
+
+#[cfg(test)]
+mod failover_policy_tests {
+    use super::{
+        should_rollback_source_after_tower_failure, tower_failure_action,
+        tower_unavailable_error, FailoverMode, TowerFailureAction,
+    };
+
+    #[test]
+    fn automatic_failover_promotes_standby_when_source_is_unreachable() {
+        let mode = FailoverMode::for_confirmed_delinquency(false);
+        let plan = mode.step_plan();
+
+        assert_eq!(mode, FailoverMode::DegradedSourceUnavailable);
+        assert!(!plan.demote_source);
+        assert!(!plan.transfer_tower);
+        assert!(plan.promote_standby);
+    }
+
+    #[test]
+    fn automatic_failover_uses_best_effort_source_steps_when_reachable() {
+        let mode = FailoverMode::for_confirmed_delinquency(true);
+        let plan = mode.step_plan();
+
+        assert_eq!(mode, FailoverMode::Graceful);
+        assert!(plan.demote_source);
+        assert!(plan.transfer_tower);
+        assert!(plan.promote_standby);
+    }
+
+    #[test]
+    fn missing_tower_continues_only_after_source_identity_is_demoted() {
+        let unavailable = tower_unavailable_error("tower missing");
+        assert_eq!(
+            tower_failure_action(true, &unavailable),
+            TowerFailureAction::ContinueWithoutTower
+        );
+        assert_eq!(
+            tower_failure_action(false, &unavailable),
+            TowerFailureAction::Abort
+        );
+    }
+
+    #[test]
+    fn tower_integrity_or_destination_failures_still_abort() {
+        let checksum_error = anyhow::anyhow!("Tower file checksum mismatch");
+        let destination_error = anyhow::anyhow!("Failed to write tower file");
+
+        let checksum_action = tower_failure_action(true, &checksum_error);
+        let destination_action = tower_failure_action(true, &destination_error);
+
+        assert_eq!(checksum_action, TowerFailureAction::Abort);
+        assert_eq!(destination_action, TowerFailureAction::Abort);
+        assert!(should_rollback_source_after_tower_failure(
+            true,
+            checksum_action
+        ));
+        assert!(should_rollback_source_after_tower_failure(
+            true,
+            destination_action
+        ));
+        assert!(!should_rollback_source_after_tower_failure(
+            false,
+            TowerFailureAction::Abort
+        ));
     }
 }
 
