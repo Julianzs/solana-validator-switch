@@ -300,6 +300,19 @@ pub async fn switch_command_with_confirmation(
     let active_node_with_status = &validator_status.nodes_with_status[source_idx];
     let standby_node_with_status = &validator_status.nodes_with_status[target_idx];
 
+    crate::startup_logger::append_runtime_log(
+        "INFO",
+        "svs",
+        &format!(
+            "Switch requested ({}): {} -> {} | mode={:?} | reason={:?}",
+            if dry_run { "DRY RUN" } else { "LIVE" },
+            active_node_with_status.node.label,
+            standby_node_with_status.node.label,
+            failover_mode,
+            reason
+        ),
+    );
+
     match reason {
         RoleResolutionReason::ActiveAndStandby => {}
         RoleResolutionReason::DegradedStandbyPromotion => {
@@ -533,6 +546,39 @@ pub async fn switch_command_with_confirmation(
     let switch_result = switch_manager
         .execute_switch_in_mode(dry_run, require_confirmation, failover_mode)
         .await;
+
+    match &switch_result {
+        Ok(true) => crate::startup_logger::append_runtime_log(
+            "INFO",
+            "svs",
+            &format!(
+                "Switch completed ({}): {} is now ACTIVE | mode={:?} | identity_switch={}",
+                if dry_run { "DRY RUN" } else { "LIVE" },
+                standby_node_with_status.node.label,
+                failover_mode,
+                switch_manager
+                    .identity_switch_time
+                    .map(|d| format!("{}ms", d.as_millis()))
+                    .unwrap_or_else(|| "n/a".to_string())
+            ),
+        ),
+        Ok(false) => crate::startup_logger::append_runtime_log(
+            "WARNING",
+            "svs",
+            "Switch was not completed (cancelled or unavailable)",
+        ),
+        Err(error) => crate::startup_logger::append_runtime_log(
+            "ERROR",
+            "svs",
+            &format!(
+                "Switch failed: {} -> {} | mode={:?} | {}",
+                active_node_with_status.node.label,
+                standby_node_with_status.node.label,
+                failover_mode,
+                error
+            ),
+        ),
+    }
 
     // Send Telegram notification for switch result (only for live switches)
     if !dry_run {

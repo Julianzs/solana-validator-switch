@@ -3767,6 +3767,16 @@ async fn execute_emergency_failover(
         crate::commands::switch::FailoverMode::for_confirmed_delinquency(source_reachable)
     };
 
+    crate::startup_logger::append_runtime_log(
+        "WARNING",
+        "svs",
+        &format!(
+            "AUTO-FAILOVER starting: {} -> {} | mode={:?}",
+            active_node.node.label, standby_node.node.label, failover_mode
+        ),
+    );
+    let promoted_label = standby_node.node.label.clone();
+
     // Wait a moment for the UI to stop rendering and cleanup terminal
     tokio::time::sleep(Duration::from_millis(300)).await;
 
@@ -3782,6 +3792,17 @@ async fn execute_emergency_failover(
 
     if let Err(e) = emergency_failover.execute_emergency_takeover().await {
         eprintln!("❌ Emergency failover error: {}", e);
+        crate::startup_logger::append_runtime_log(
+            "ERROR",
+            "svs",
+            &format!("AUTO-FAILOVER failed: {}", e),
+        );
+    } else {
+        crate::startup_logger::append_runtime_log(
+            "INFO",
+            "svs",
+            &format!("AUTO-FAILOVER completed: {} is now ACTIVE", promoted_label),
+        );
     }
 
     // Wait a moment for the user to see the results
