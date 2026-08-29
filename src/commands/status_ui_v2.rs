@@ -3676,22 +3676,32 @@ async fn execute_emergency_failover(
     let _flag_guard = EmergencyTakeoverFlagGuard(emergency_takeover_flag);
 
     // Find active and standby nodes
-    let (active_node, standby_node) = match (
-        validator_status
-            .nodes_with_status
-            .iter()
-            .find(|n| n.status == crate::types::NodeStatus::Active),
-        validator_status
-            .nodes_with_status
-            .iter()
-            .find(|n| n.status == crate::types::NodeStatus::Standby),
-    ) {
-        (Some(active), Some(standby)) => (active.clone(), standby.clone()),
-        _ => {
-            eprintln!("❌ Emergency failover failed: could not identify active/standby nodes");
-            return;
-        }
-    };
+    let role_inputs: Vec<crate::commands::switch::NodeRoleInput> = validator_status
+        .nodes_with_status
+        .iter()
+        .map(|n| crate::commands::switch::NodeRoleInput {
+            status: n.status.clone(),
+            has_tower: n.tower_path.is_some(),
+        })
+        .collect();
+
+    let (active_node, standby_node, resolved_reason) =
+        match crate::commands::switch::resolve_roles(&role_inputs) {
+            crate::commands::switch::RoleResolution::Resolved {
+                source_idx,
+                target_idx,
+                reason,
+                ..
+            } => (
+                validator_status.nodes_with_status[source_idx].clone(),
+                validator_status.nodes_with_status[target_idx].clone(),
+                reason,
+            ),
+            crate::commands::switch::RoleResolution::Ambiguous(message) => {
+                eprintln!("❌ Emergency failover failed: {}", message);
+                return;
+            }
+        };
 
     // The standby is the only hard SSH dependency in a disaster takeover.
     // If it cannot be reached there is nowhere safe to promote, so abort.
@@ -3720,27 +3730,42 @@ async fn execute_emergency_failover(
     // reached this function only after healthy cluster RPC confirmed vote
     // delinquency, so an unreachable source is expected during a reboot and
     // must not block standby promotion.
-    let source_reachable = match detected_ssh_keys.get(&active_node.node.host) {
-        Some(key) => match ssh_pool.get_session(&active_node.node, key).await {
-            Ok(_) => true,
-            Err(error) => {
+    //
+    // When role resolution already concluded the source is not reporting an
+    // identity, SSH reachability is irrelevant: there is no funded identity to
+    // demote and no tower to copy, so force the degraded plan. Probing SSH here
+    // would wrongly select Graceful for a host that answers SSH but has no
+    // running validator.
+    let failover_mode = if resolved_reason
+        == crate::commands::switch::RoleResolutionReason::DegradedStandbyPromotion
+    {
+        eprintln!(
+            "⚠️  {} is not reporting an identity. Continuing degraded takeover without source demotion or tower copy.",
+            active_node.node.label
+        );
+        crate::commands::switch::FailoverMode::DegradedSourceUnavailable
+    } else {
+        let source_reachable = match detected_ssh_keys.get(&active_node.node.host) {
+            Some(key) => match ssh_pool.get_session(&active_node.node, key).await {
+                Ok(_) => true,
+                Err(error) => {
+                    eprintln!(
+                        "⚠️  Primary pre-warm failed for {}: {}. Continuing degraded takeover without source demotion or tower copy.",
+                        active_node.node.host, error
+                    );
+                    false
+                }
+            },
+            None => {
                 eprintln!(
-                    "⚠️  Primary pre-warm failed for {}: {}. Continuing degraded takeover without source demotion or tower copy.",
-                    active_node.node.host, error
+                    "⚠️  No SSH key detected for primary host {}. Continuing degraded takeover without source demotion or tower copy.",
+                    active_node.node.host
                 );
                 false
             }
-        },
-        None => {
-            eprintln!(
-                "⚠️  No SSH key detected for primary host {}. Continuing degraded takeover without source demotion or tower copy.",
-                active_node.node.host
-            );
-            false
-        }
+        };
+        crate::commands::switch::FailoverMode::for_confirmed_delinquency(source_reachable)
     };
-    let failover_mode =
-        crate::commands::switch::FailoverMode::for_confirmed_delinquency(source_reachable);
 
     // Wait a moment for the UI to stop rendering and cleanup terminal
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -3802,47 +3827,79 @@ fn draw_switch_ui(f: &mut ratatui::Frame, app_state: &AppState, ui_state: &UiSta
     if !app_state.validator_statuses.is_empty() {
         let validator_status = &app_state.validator_statuses[ui_state.selected_validator_index];
 
-        let active_node = validator_status
-            .nodes_with_status
-            .iter()
-            .find(|n| n.status == crate::types::NodeStatus::Active);
-        let standby_node = validator_status
-            .nodes_with_status
-            .iter()
-            .find(|n| n.status == crate::types::NodeStatus::Standby);
+    let role_inputs: Vec<crate::commands::switch::NodeRoleInput> = validator_status
+        .nodes_with_status
+        .iter()
+        .map(|n| crate::commands::switch::NodeRoleInput {
+            status: n.status.clone(),
+            has_tower: n.tower_path.is_some(),
+        })
+        .collect();
+    let resolution = crate::commands::switch::resolve_roles(&role_inputs);
 
-        let mut status_text = vec![];
-        status_text.push(
-            Line::from("Current State:").style(Style::default().add_modifier(Modifier::BOLD)),
-        );
+    let mut status_text = vec![];
+    status_text.push(
+        Line::from("Current State:").style(Style::default().add_modifier(Modifier::BOLD)),
+    );
 
-        if let (Some(active), Some(standby)) = (active_node, standby_node) {
+    let mut degraded = false;
+    let mut resolvable = false;
+    match &resolution {
+        crate::commands::switch::RoleResolution::Resolved {
+            source_idx,
+            target_idx,
+            reason,
+            ..
+        } => {
+            let source = &validator_status.nodes_with_status[*source_idx];
+            let target = &validator_status.nodes_with_status[*target_idx];
+            resolvable = true;
+            degraded = *reason
+                == crate::commands::switch::RoleResolutionReason::DegradedStandbyPromotion;
+
+            if degraded {
+                status_text.push(
+                    Line::from(format!(
+                        "  {} → UNREACHABLE (no identity reported)",
+                        source.node.label
+                    ))
+                    .style(Style::default().fg(Color::Red)),
+                );
+            } else {
+                status_text.push(
+                    Line::from(format!("  {} → ACTIVE", source.node.label))
+                        .style(Style::default().fg(Color::Green)),
+                );
+            }
             status_text.push(
-                Line::from(format!("  {} → ACTIVE", active.node.label))
-                    .style(Style::default().fg(Color::Green)),
-            );
-            status_text.push(
-                Line::from(format!("  {} → STANDBY", standby.node.label))
+                Line::from(format!("  {} → STANDBY", target.node.label))
                     .style(Style::default().fg(Color::Yellow)),
             );
             status_text.push(Line::from(""));
             status_text.push(
                 Line::from("After Switch:").style(Style::default().add_modifier(Modifier::BOLD)),
             );
+            if degraded {
+                status_text.push(
+                    Line::from(format!("  {} → UNCHANGED (unreachable)", source.node.label))
+                        .style(Style::default().fg(Color::Red)),
+                );
+            } else {
+                status_text.push(
+                    Line::from(format!("  {} → STANDBY (was active)", source.node.label))
+                        .style(Style::default().fg(Color::Yellow)),
+                );
+            }
             status_text.push(
-                Line::from(format!("  {} → STANDBY (was active)", active.node.label))
-                    .style(Style::default().fg(Color::Yellow)),
-            );
-            status_text.push(
-                Line::from(format!("  {} → ACTIVE (was standby)", standby.node.label))
+                Line::from(format!("  {} → ACTIVE (was standby)", target.node.label))
                     .style(Style::default().fg(Color::Green)),
             );
-        } else {
-            status_text.push(
-                Line::from("Unable to determine active/standby nodes")
-                    .style(Style::default().fg(Color::Red)),
-            );
         }
+        crate::commands::switch::RoleResolution::Ambiguous(message) => {
+            status_text
+                .push(Line::from(*message).style(Style::default().fg(Color::Red)));
+        }
+    }
 
         let status_widget = Paragraph::new(status_text).block(
             Block::default()
@@ -3853,16 +3910,48 @@ fn draw_switch_ui(f: &mut ratatui::Frame, app_state: &AppState, ui_state: &UiSta
         f.render_widget(status_widget, content_chunks[0]);
 
         // Actions that will be performed
-        let actions_text = vec![
-            Line::from("Actions that will be performed:")
-                .style(Style::default().add_modifier(Modifier::BOLD)),
-            Line::from("  1. Switch active node to unfunded identity"),
-            Line::from("  2. Delete tower file on standby node"),
-            Line::from("  3. Switch standby node to funded identity"),
-            Line::from(""),
-            Line::from("[!] Press 'y' to confirm switch or 'q' to cancel")
-                .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
-        ];
+        let mut actions_text = vec![Line::from("Actions that will be performed:")
+            .style(Style::default().add_modifier(Modifier::BOLD))];
+        if !resolvable {
+            actions_text.push(
+                Line::from("  Switching is unavailable until node roles are known.")
+                    .style(Style::default().fg(Color::Red)),
+            );
+            actions_text.push(Line::from(""));
+            actions_text.push(
+                Line::from("[!] Press 'q' to cancel")
+                    .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            );
+        } else {
+            if degraded {
+                actions_text.push(
+                    Line::from("  1. Switch standby node to funded identity")
+                        .style(Style::default().fg(Color::Green)),
+                );
+                actions_text.push(Line::from(""));
+                actions_text.push(
+                    Line::from("Source demotion and tower transfer are skipped -")
+                        .style(Style::default().fg(Color::Yellow)),
+                );
+                actions_text.push(
+                    Line::from("the active node reports no identity. The standby will")
+                        .style(Style::default().fg(Color::Yellow)),
+                );
+                actions_text.push(
+                    Line::from("activate without the latest tower and may miss votes.")
+                        .style(Style::default().fg(Color::Yellow)),
+                );
+            } else {
+                actions_text.push(Line::from("  1. Switch active node to unfunded identity"));
+                actions_text.push(Line::from("  2. Transfer tower file to standby node"));
+                actions_text.push(Line::from("  3. Switch standby node to funded identity"));
+            }
+            actions_text.push(Line::from(""));
+            actions_text.push(
+                Line::from("[!] Press 'y' to confirm switch or 'q' to cancel")
+                    .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            );
+        }
 
         let actions_widget = Paragraph::new(actions_text).block(
             Block::default()
