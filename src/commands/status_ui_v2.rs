@@ -333,13 +333,19 @@ async fn refresh_vote_data_for_alerts(
     let ui_state_health = ui_state.clone();
     let log_sender_health = log_sender.clone();
     let alert_manager_health = alert_manager.clone();
+    // Roles for the skip-the-active-node decision must be the live ones. The
+    // `app_state` snapshot is only rebuilt when the UI loop restarts, so after
+    // an automatic failover it names the wrong node — which both adds getHealth
+    // load to the production active node and, worse, stops the real standby
+    // from being health-checked at all.
+    let roles_health = validator_statuses.clone();
 
     tokio::spawn(async move {
-        for (vidx, validator_status) in app_state_health.validator_statuses.iter().enumerate() {
+        for (vidx, validator_status) in roles_health.iter().enumerate() {
             // Precompute values that inner tasks need so they don't capture the
             // entire `app_state_health` Arc (which would move it on the first
             // iteration and break subsequent iterations).
-            let validator_count = app_state_health.validator_statuses.len();
+            let validator_count = roles_health.len();
             let validator_identity = validator_status.validator_pair.identity_pubkey.clone();
 
             for (nidx, node_with_status) in validator_status.nodes_with_status.iter().enumerate() {
