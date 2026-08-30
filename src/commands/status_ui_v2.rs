@@ -705,6 +705,11 @@ async fn refresh_vote_data_for_alerts(
                 NodeHealthStatus,
                 bool,
                 u32,
+                // send_alert: false when the notification is within its
+                // cooldown. The entry is still enqueued so the auto-failover
+                // gate is evaluated — throttling alerts must not throttle
+                // recovery.
+                bool,
             )> = Vec::new();
 
             for (idx, last) in state.last_vote_slot_times.iter().enumerate() {
@@ -837,10 +842,18 @@ async fn refresh_vote_data_for_alerts(
                                 idx,
                             )
                         };
-                        if should_enqueue {
-                            // proceed to enqueue alert
-                        } else {
-                            // Alert suppressed due to cooldown - log suppression with remaining time
+                        let send_alert = delinquency_disposition(should_enqueue).send_alert;
+                        if !send_alert {
+                            // Alert suppressed due to cooldown - log suppression with remaining time.
+                            //
+                            // Deliberately does NOT skip the rest of this
+                            // iteration. The auto-failover gate below is fed by
+                            // `alerts_to_send`, so `continue`ing here made
+                            // notification throttling silently disable recovery:
+                            // after a failover sent its alert, a second node
+                            // failure went unhandled for the whole cooldown.
+                            // Observed as takeovers firing at exact 15-minute
+                            // intervals - the cooldown expiring, not the fault.
                             let remaining = tracker
                                 .delinquency_tracker
                                 .seconds_until_next_alert(idx)
@@ -849,15 +862,12 @@ async fn refresh_vote_data_for_alerts(
                             let _ = log_sender.send(LogMessage {
                                 host: validator_log_host_for(&validator_statuses, idx),
                                 message: format!(
-                                    "Delinquency alert suppressed by cooldown: {}s remaining (threshold: {}s)",
+                                    "Delinquency alert suppressed by cooldown: {}s remaining (threshold: {}s); failover gate still evaluated",
                                     remaining, threshold
                                 ),
                                 timestamp: Instant::now(),
                                 level: LogLevel::Info,
                             });
-
-                            // skip enqueueing
-                            continue;
                         }
                         // Determine active node (fallback to first node)
                         let active_node = if let Some(node_with_status) = validator_statuses[idx]
@@ -878,7 +888,7 @@ async fn refresh_vote_data_for_alerts(
                         let is_backup = !is_active;
                         let node_health = state.validator_health[idx].clone();
 
-                        alerts_to_send.push((idx, is_backup, active_node, *last_slot, seconds_since_vote, node_health, is_active, vote_rpc_failures));
+                        alerts_to_send.push((idx, is_backup, active_node, *last_slot, seconds_since_vote, node_health, is_active, vote_rpc_failures, send_alert));
                     }
                 }
             }
@@ -886,7 +896,7 @@ async fn refresh_vote_data_for_alerts(
             // Release tracker lock before awaiting network calls
             drop(tracker);
 
-            for (idx, is_backup, active_node, last_slot, seconds_since_vote, node_health, is_active, vote_rpc_failures) in alerts_to_send {
+            for (idx, is_backup, active_node, last_slot, seconds_since_vote, node_health, is_active, vote_rpc_failures, send_alert) in alerts_to_send {
                 let alert_mgr_for_telegram = alert_mgr.clone();
                 let log_sender_for_telegram = log_sender.clone();
                 let identity = app_state.validator_statuses[idx].validator_pair.identity_pubkey.clone();
@@ -894,6 +904,9 @@ async fn refresh_vote_data_for_alerts(
                 let sim_idx = simulate_failover_idx();
                 let suppress_telegram = sim_idx == Some(idx);
 
+                // Alert sending is throttled by cooldown; the failover gate
+                // below is not. Only this block is skipped when suppressed.
+                if send_alert {
                 // Pre-send log: record alert intent and priority
                 let _ = log_sender.send(LogMessage {
                     host: host_for_log.clone(),
@@ -964,6 +977,7 @@ async fn refresh_vote_data_for_alerts(
                         });
                     }
                 });
+                }
 
                 // ── Change 1: Auto-failover trigger ──
                 //
@@ -1705,6 +1719,30 @@ fn clear_throttle_timestamps_for_node(validator_idx: usize, node_idx: usize) {
         .get_or_init(|| Mutex::new(std::collections::HashMap::new()));
     let mut guard = map.lock().unwrap();
     guard.retain(|(vidx, nidx, _), _| !(*vidx == validator_idx && *nidx == node_idx));
+}
+
+/// What to do about a detected delinquency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DelinquencyDisposition {
+    /// Send the operator notification. Subject to the alert cooldown.
+    pub send_alert: bool,
+    /// Evaluate the auto-failover gate. Never subject to the alert cooldown.
+    pub evaluate_failover: bool,
+}
+
+/// Split notification throttling from recovery.
+///
+/// These were previously the same decision: a delinquency whose alert was in
+/// cooldown was skipped entirely, and since the auto-failover gate is fed by
+/// the same queue, recovery was skipped with it. After a failover sent its
+/// alert, a second node failure went unhandled for the full cooldown — visible
+/// as takeovers firing at exact 15-minute intervals, which is the cooldown
+/// expiring rather than the fault being detected.
+pub(crate) fn delinquency_disposition(alert_allowed_by_cooldown: bool) -> DelinquencyDisposition {
+    DelinquencyDisposition {
+        send_alert: alert_allowed_by_cooldown,
+        evaluate_failover: true,
+    }
 }
 
 /// Prefer the live role for each node, falling back to the snapshot only where
@@ -5361,6 +5399,45 @@ mod shutdown_tests {
         assert_eq!(
             classify_switch_attempt(Ok(false)),
             SwitchAttemptOutcome::NotCompleted
+        );
+    }
+}
+
+#[cfg(test)]
+mod delinquency_disposition_tests {
+    //! Throttling a notification must never throttle recovery.
+
+    use super::delinquency_disposition;
+
+    #[test]
+    fn cooldown_silences_the_alert_but_not_the_failover_gate() {
+        let within_cooldown = delinquency_disposition(false);
+
+        assert!(!within_cooldown.send_alert, "alert should be suppressed");
+        assert!(
+            within_cooldown.evaluate_failover,
+            "recovery must still be considered while the alert is in cooldown"
+        );
+    }
+
+    #[test]
+    fn clear_cooldown_does_both() {
+        let clear = delinquency_disposition(true);
+
+        assert!(clear.send_alert);
+        assert!(clear.evaluate_failover);
+    }
+
+    #[test]
+    fn failover_evaluation_never_depends_on_the_cooldown() {
+        // The property that regressed: these two must not move together.
+        assert_eq!(
+            delinquency_disposition(true).evaluate_failover,
+            delinquency_disposition(false).evaluate_failover
+        );
+        assert_ne!(
+            delinquency_disposition(true).send_alert,
+            delinquency_disposition(false).send_alert
         );
     }
 }
