@@ -4976,6 +4976,21 @@ async fn refresh_node_version(
     }
 }
 
+/// Whether swap readiness should treat this node as a standby.
+///
+/// Standby nodes are exempt from the tower-file requirement: the tower is
+/// transferred from the active node during a graceful switch, so a standby is
+/// not expected to hold one. Getting this wrong is not cosmetic — a node
+/// demoted by failover keeps reporting "Not Ready: Tower file missing" until
+/// the process restarts.
+///
+/// `None` (role not yet known) deliberately maps to `None`, which
+/// `check_node_swap_readiness` treats as "not a standby" — the conservative
+/// choice, since enforcing an extra check is safer than skipping one.
+pub(crate) fn readiness_is_standby(status: Option<&crate::types::NodeStatus>) -> Option<bool> {
+    status.map(|s| *s == crate::types::NodeStatus::Standby)
+}
+
 /// Entry point for the enhanced UI
 async fn refresh_swap_readiness(
     app_state: Arc<AppState>,
@@ -4998,9 +5013,9 @@ async fn refresh_swap_readiness(
             .and_then(|vs| vs.nodes_with_status.get(node_idx))
             .map(|n| n.status.clone())
     };
-    if let Some(status) = primary_status {
+    if let Some(status) = primary_status.as_ref() {
         if should_throttle_primary_check(
-            &status,
+            status,
             validator_idx,
             node_idx,
             "swap_readiness",
@@ -5015,7 +5030,7 @@ async fn refresh_swap_readiness(
 
         // Heartbeat for the primary's 10-minute swap-readiness check. See
         // the matching comment in refresh_node_status_and_identity.
-        if status == crate::types::NodeStatus::Active {
+        if *status == crate::types::NodeStatus::Active {
             let host_label = app_state
                 .validator_statuses
                 .get(validator_idx)
@@ -5055,13 +5070,18 @@ async fn refresh_swap_readiness(
             let ssh_key = app_state.detected_ssh_keys.get(&node.node.host);
 
             if let Some(ssh_key) = ssh_key {
-                // Check swap readiness for the node
+                // Role must come from live UI state, not from `app_state`.
+                // `app_state` is a snapshot taken once per UI-loop iteration,
+                // so after a failover demotes a node it still records the old
+                // role. Checking a standby as if it were active enforces the
+                // tower requirement and reports a spurious "Tower file
+                // missing" that never clears.
                 let (ready, issues) = check_node_swap_readiness(
                     &app_state.ssh_pool,
                     &node.node,
                     ssh_key,
                     node.ledger_path.as_ref(),
-                    Some(node.status == crate::types::NodeStatus::Standby),
+                    readiness_is_standby(primary_status.as_ref()),
                 )
                 .await;
                 let (swap_ready, swap_issues) = (Some(ready), issues);
@@ -5228,6 +5248,53 @@ mod shutdown_tests {
             classify_switch_attempt(Ok(false)),
             SwitchAttemptOutcome::NotCompleted
         );
+    }
+}
+
+#[cfg(test)]
+mod readiness_role_tests {
+    //! Swap readiness must be evaluated against the node's *current* role.
+    //!
+    //! `app_state` is a snapshot taken once per UI-loop iteration. After a
+    //! failover demotes a node, that snapshot still records it as Active, so
+    //! deriving the role from it enforced the tower-file requirement against a
+    //! standby and pinned the UI to "Not Ready: Tower file missing" until the
+    //! process restarted. Live UI state is the only correct source.
+
+    use super::readiness_is_standby;
+    use crate::types::NodeStatus;
+
+    #[test]
+    fn standby_is_exempt_from_the_tower_requirement() {
+        assert_eq!(readiness_is_standby(Some(&NodeStatus::Standby)), Some(true));
+    }
+
+    #[test]
+    fn active_still_requires_a_tower() {
+        assert_eq!(readiness_is_standby(Some(&NodeStatus::Active)), Some(false));
+    }
+
+    #[test]
+    fn unknown_role_does_not_skip_the_tower_check() {
+        // Unknown means we could not confirm the role; enforcing the extra
+        // check is the conservative direction to fail.
+        assert_eq!(
+            readiness_is_standby(Some(&NodeStatus::Unknown)),
+            Some(false)
+        );
+        assert_eq!(readiness_is_standby(None), None);
+    }
+
+    #[test]
+    fn demoted_node_stops_requiring_a_tower_once_role_is_live() {
+        // Regression: the pre-fix path read the role from the stale snapshot,
+        // so this transition never happened and the warning stuck.
+        let before_failover = readiness_is_standby(Some(&NodeStatus::Active));
+        let after_failover = readiness_is_standby(Some(&NodeStatus::Standby));
+
+        assert_eq!(before_failover, Some(false));
+        assert_eq!(after_failover, Some(true));
+        assert_ne!(before_failover, after_failover);
     }
 }
 
