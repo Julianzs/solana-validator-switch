@@ -86,6 +86,13 @@ enum Commands {
 pub struct AppState {
     pub ssh_pool: Arc<AsyncSshPool>,
     pub config: types::Config,
+    /// Validator/node state as detected at startup.
+    ///
+    /// The `status` field on each node is a point-in-time role. An automatic
+    /// failover swaps roles without rebuilding this, so in any long-running
+    /// context (the status UI) these roles go stale and stay stale until a
+    /// restart. Refresh them from live UI state before using them for a
+    /// decision — see `AssertedNodeRoles`.
     pub validator_statuses: Vec<ValidatorStatus>,
     pub metadata_cache: Arc<tokio::sync::Mutex<validator_metadata::MetadataCache>>,
     pub detected_ssh_keys: std::collections::HashMap<String, String>, // host -> key_path mapping

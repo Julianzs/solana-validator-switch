@@ -3748,14 +3748,16 @@ async fn execute_emergency_failover(
     let _flag_guard = EmergencyTakeoverFlagGuard(emergency_takeover_flag);
 
     // Find active and standby nodes
-    let role_inputs: Vec<crate::commands::switch::NodeRoleInput> = validator_status
-        .nodes_with_status
-        .iter()
-        .map(|n| crate::commands::switch::NodeRoleInput {
-            status: n.status.clone(),
-            has_tower: n.tower_path.is_some(),
-        })
-        .collect();
+    let role_inputs = crate::commands::switch::AssertedNodeRoles::from_live_ui_state(
+        validator_status
+            .nodes_with_status
+            .iter()
+            .map(|n| crate::commands::switch::NodeRoleInput {
+                status: n.status.clone(),
+                has_tower: n.tower_path.is_some(),
+            })
+            .collect(),
+    );
 
     let (active_node, standby_node, resolved_reason) =
         match crate::commands::switch::resolve_roles(&role_inputs) {
@@ -3929,18 +3931,20 @@ fn draw_switch_ui(f: &mut ratatui::Frame, app_state: &AppState, ui_state: &UiSta
             .get(ui_state.selected_validator_index)
             .map(|vs| &vs.nodes_with_status);
 
-        let role_inputs: Vec<crate::commands::switch::NodeRoleInput> = validator_status
-            .nodes_with_status
-            .iter()
-            .enumerate()
-            .map(|(idx, n)| crate::commands::switch::NodeRoleInput {
-                status: live_nodes
-                    .and_then(|nodes| nodes.get(idx))
-                    .map(|live| live.status.clone())
-                    .unwrap_or_else(|| n.status.clone()),
-                has_tower: n.tower_path.is_some(),
-            })
-            .collect();
+        let role_inputs = crate::commands::switch::AssertedNodeRoles::from_live_ui_state(
+            validator_status
+                .nodes_with_status
+                .iter()
+                .enumerate()
+                .map(|(idx, n)| crate::commands::switch::NodeRoleInput {
+                    status: live_nodes
+                        .and_then(|nodes| nodes.get(idx))
+                        .map(|live| live.status.clone())
+                        .unwrap_or_else(|| n.status.clone()),
+                    has_tower: n.tower_path.is_some(),
+                })
+                .collect(),
+        );
         let resolution = crate::commands::switch::resolve_roles(&role_inputs);
 
     let mut status_text = vec![];

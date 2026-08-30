@@ -123,6 +123,40 @@ pub(crate) enum RoleResolution {
     Ambiguous(&'static str),
 }
 
+/// Node roles carrying an assertion about where they came from.
+///
+/// Roles are the single most dangerous input to a failover: get them stale and
+/// the switch runs backwards, demoting the healthy node and promoting the one
+/// that already failed. `AppState` holds roles detected at startup and an
+/// automatic failover does not refresh them, so reading roles from it in a
+/// long-running UI produced exactly that.
+///
+/// `resolve_roles` only accepts this type, so every caller has to say which
+/// constructor applies. There is no way to pass roles without making that claim.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct AssertedNodeRoles(Vec<NodeRoleInput>);
+
+impl AssertedNodeRoles {
+    /// Roles read from live UI state on this tick.
+    pub(crate) fn from_live_ui_state(roles: Vec<NodeRoleInput>) -> Self {
+        Self(roles)
+    }
+
+    /// Roles from an `AppState` the caller guarantees is current — either built
+    /// moments ago by startup detection (one-shot CLI paths) or just refreshed
+    /// from live UI state before the call.
+    ///
+    /// Never valid for an `AppState` that has outlived a failover without being
+    /// refreshed; that is the stale read this type exists to prevent.
+    pub(crate) fn from_current_app_state(roles: Vec<NodeRoleInput>) -> Self {
+        Self(roles)
+    }
+
+    fn as_slice(&self) -> &[NodeRoleInput] {
+        &self.0
+    }
+}
+
 /// Decide which node to demote and which to promote.
 ///
 /// Role comes from an RPC identity probe, so a node whose validator process is
@@ -131,8 +165,10 @@ pub(crate) enum RoleResolution {
 /// alongside unreachable peers resolves to a degraded takeover. Direction is
 /// always derived from observed roles — never from position in the config —
 /// because a positional guess can promote a dead node and demote a live one.
-pub(crate) fn resolve_roles(nodes: &[NodeRoleInput]) -> RoleResolution {
+pub(crate) fn resolve_roles(roles: &AssertedNodeRoles) -> RoleResolution {
     use crate::types::NodeStatus;
+
+    let nodes = roles.as_slice();
 
     if nodes.len() < 2 {
         return RoleResolution::Ambiguous(
@@ -279,14 +315,20 @@ pub async fn switch_command_with_confirmation(
     }
 
     // Resolve direction from observed roles rather than config order.
-    let role_inputs: Vec<NodeRoleInput> = validator_status
-        .nodes_with_status
-        .iter()
-        .map(|n| NodeRoleInput {
-            status: n.status.clone(),
-            has_tower: n.tower_path.is_some(),
-        })
-        .collect();
+    //
+    // Roles here must already be current: the TUI refreshes them from live UI
+    // state before calling, and the one-shot CLI paths build `app_state`
+    // immediately beforehand.
+    let role_inputs = AssertedNodeRoles::from_current_app_state(
+        validator_status
+            .nodes_with_status
+            .iter()
+            .map(|n| NodeRoleInput {
+                status: n.status.clone(),
+                has_tower: n.tower_path.is_some(),
+            })
+            .collect(),
+    );
 
     let (source_idx, target_idx, failover_mode, reason) = match resolve_roles(&role_inputs) {
         RoleResolution::Resolved {
@@ -1775,7 +1817,10 @@ mod role_resolution_tests {
     //! ("Unable to determine active/standby nodes") or fell back to positional
     //! order, which could demote the only healthy node and promote the dead one.
 
-    use super::{resolve_roles, FailoverMode, NodeRoleInput, RoleResolution, RoleResolutionReason};
+    use super::{
+        resolve_roles, AssertedNodeRoles, FailoverMode, NodeRoleInput, RoleResolution,
+        RoleResolutionReason,
+    };
     use crate::types::NodeStatus;
 
     fn node(status: NodeStatus, has_tower: bool) -> NodeRoleInput {
@@ -1790,7 +1835,7 @@ mod role_resolution_tests {
         ];
 
         assert_eq!(
-            resolve_roles(&nodes),
+            resolve_roles(&AssertedNodeRoles::from_live_ui_state(nodes.clone())),
             RoleResolution::Resolved {
                 source_idx: 0,
                 target_idx: 1,
@@ -1807,7 +1852,7 @@ mod role_resolution_tests {
             node(NodeStatus::Unknown, false),
         ];
 
-        let resolution = resolve_roles(&nodes);
+        let resolution = resolve_roles(&AssertedNodeRoles::from_live_ui_state(nodes.clone()));
 
         assert_eq!(
             resolution,
@@ -1848,7 +1893,7 @@ mod role_resolution_tests {
                 target_idx,
                 mode,
                 reason,
-            } = resolve_roles(&nodes)
+            } = resolve_roles(&AssertedNodeRoles::from_live_ui_state(nodes.clone()))
             else {
                 panic!("expected a resolved direction");
             };
@@ -1870,7 +1915,7 @@ mod role_resolution_tests {
         ];
 
         assert_eq!(
-            resolve_roles(&tower_on_second),
+            resolve_roles(&AssertedNodeRoles::from_live_ui_state(tower_on_second)),
             RoleResolution::Resolved {
                 source_idx: 1,
                 target_idx: 0,
@@ -1886,7 +1931,7 @@ mod role_resolution_tests {
             node(NodeStatus::Standby, false),
         ];
         assert_eq!(
-            resolve_roles(&no_tower),
+            resolve_roles(&AssertedNodeRoles::from_live_ui_state(no_tower)),
             RoleResolution::Resolved {
                 source_idx: 0,
                 target_idx: 1,
@@ -1907,7 +1952,7 @@ mod role_resolution_tests {
             node(NodeStatus::Unknown, false),
         ];
 
-        let RoleResolution::Ambiguous(message) = resolve_roles(&nodes) else {
+        let RoleResolution::Ambiguous(message) = resolve_roles(&AssertedNodeRoles::from_live_ui_state(nodes.clone())) else {
             panic!("promoting an unverifiable node must be refused");
         };
         assert!(
@@ -1925,7 +1970,7 @@ mod role_resolution_tests {
         ];
 
         assert_eq!(
-            resolve_roles(&nodes),
+            resolve_roles(&AssertedNodeRoles::from_live_ui_state(nodes.clone())),
             RoleResolution::Resolved {
                 source_idx: 0,
                 target_idx: 1,
@@ -1958,7 +2003,7 @@ mod role_resolution_tests {
             active_without_standby,
         ] {
             assert!(
-                matches!(resolve_roles(&nodes), RoleResolution::Ambiguous(_)),
+                matches!(resolve_roles(&AssertedNodeRoles::from_live_ui_state(nodes.clone())), RoleResolution::Ambiguous(_)),
                 "expected refusal for {:?}",
                 nodes
             );
