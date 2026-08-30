@@ -128,8 +128,57 @@ async fn refresh_vote_data_for_alerts(
 ) {
     let mut new_vote_data = Vec::new();
 
+    // Node roles must come from live UI state, not from `app_state`.
+    //
+    // `app_state` is a snapshot taken once per UI-loop iteration, and an
+    // automatic failover does not recreate the app — so once one fires, the
+    // snapshot keeps the pre-failover roles indefinitely. Every role-keyed
+    // decision below is then computed against a stale view: alerts name the
+    // wrong node, priority is misclassified, and most seriously the direction
+    // of the *next* failover is inverted, demoting the healthy node and
+    // "promoting" the one that already failed.
+    //
+    // The snapshot still supplies everything else (detected paths, executables,
+    // ledger locations), so only `status` is overlaid.
+    let validator_statuses: Vec<crate::ValidatorStatus> = {
+        let ui_read = ui_state.read().await;
+        app_state
+            .validator_statuses
+            .iter()
+            .enumerate()
+            .map(|(idx, snapshot)| {
+                let mut corrected = snapshot.clone();
+                let snapshot_roles: Vec<crate::types::NodeStatus> = snapshot
+                    .nodes_with_status
+                    .iter()
+                    .map(|n| n.status.clone())
+                    .collect();
+                let live_roles: Vec<crate::types::NodeStatus> = ui_read
+                    .validator_statuses
+                    .get(idx)
+                    .map(|vs| {
+                        vs.nodes_with_status
+                            .iter()
+                            .map(|n| n.status.clone())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                for (node_idx, role) in resolve_live_roles(&snapshot_roles, &live_roles)
+                    .into_iter()
+                    .enumerate()
+                {
+                    if let Some(node) = corrected.nodes_with_status.get_mut(node_idx) {
+                        node.status = role;
+                    }
+                }
+                corrected
+            })
+            .collect()
+    };
+
     // Fetch vote data for all validators
-    for (idx, validator_status) in app_state.validator_statuses.iter().enumerate() {
+    for (idx, validator_status) in validator_statuses.iter().enumerate() {
         let validator_pair = &validator_status.validator_pair;
         
             // Use active node label for better identification
@@ -156,7 +205,7 @@ async fn refresh_vote_data_for_alerts(
                     }
                     Err(e) => {
                         let _ = log_sender.send(LogMessage {
-                            host: validator_log_host(&app_state, idx),
+                            host: validator_log_host_for(&validator_statuses, idx),
                             message: format!(
                                 "ui_state write lock timed out while recording RPC success for validator {}: {}",
                                 idx, e
@@ -168,7 +217,7 @@ async fn refresh_vote_data_for_alerts(
                 }
 
                 let _ = log_sender.send(LogMessage {
-                    host: validator_log_host(&app_state, idx),
+                    host: validator_log_host_for(&validator_statuses, idx),
                     message: format!(
                             "[{}] Vote data fetched: last slot {}",
                             node_label,
@@ -221,7 +270,7 @@ async fn refresh_vote_data_for_alerts(
                         }
                         Err(e) => {
                             let _ = log_sender.send(LogMessage {
-                                host: validator_log_host(&app_state, idx),
+                                host: validator_log_host_for(&validator_statuses, idx),
                                 message: format!(
                                     "ui_state write lock timed out while recording RPC failure for validator {}: {}",
                                     idx, e
@@ -246,7 +295,7 @@ async fn refresh_vote_data_for_alerts(
                             .await
                         {
                             let _ = log_sender.send(LogMessage {
-                                host: validator_log_host(&app_state, idx),
+                                host: validator_log_host_for(&validator_statuses, idx),
                                 message: format!(
                                     "Failed to send LOW-PRIORITY vote-account RPC failure alert: {}",
                                     send_err
@@ -259,7 +308,7 @@ async fn refresh_vote_data_for_alerts(
                 }
 
                 let _ = log_sender.send(LogMessage {
-                    host: validator_log_host(&app_state, idx),
+                    host: validator_log_host_for(&validator_statuses, idx),
                         message: format!("[{}] Failed to fetch vote data: {}", node_label, error_message),
                     timestamp: Instant::now(),
                     level: LogLevel::Error,
@@ -677,21 +726,20 @@ async fn refresh_vote_data_for_alerts(
                         let mut logged = simulation_force_logged().lock().unwrap();
                         if logged.insert(idx) {
                             drop(logged);
-                            let host = if let Some(node_with_status) = app_state
-                                .validator_statuses[idx]
+                            let host = if let Some(node_with_status) = validator_statuses[idx]
                                 .nodes_with_status
                                 .iter()
                                 .find(|n| n.status == crate::types::NodeStatus::Active)
                             {
                                 node_with_status.node.host.clone()
                             } else {
-                                app_state.validator_statuses[idx].nodes_with_status[0]
+                                validator_statuses[idx].nodes_with_status[0]
                                     .node
                                     .host
                                     .clone()
                             };
                             let _ = log_sender.send(LogMessage {
-                                host: validator_log_host(&app_state, idx),
+                                host: validator_log_host_for(&validator_statuses, idx),
                                 message: format!(
                                     "🧪 SIMULATION: forcing node[{}] {} to appear delinquent for gate evaluation (seconds_since_vote={}, vote_rpc_failures=0)",
                                     idx, host, seconds_since_vote
@@ -705,17 +753,17 @@ async fn refresh_vote_data_for_alerts(
 
                     // Log delinquency check for debugging
                     let _ = log_sender.send(LogMessage {
-                        host: validator_log_host(&app_state, idx),
+                        host: validator_log_host_for(&validator_statuses, idx),
                             message: format!("[{}] Delinquency check: {} seconds without vote (threshold: {}s){}",
                                 // Use active node label for identification
-                                if let Some(node_with_status) = app_state.validator_statuses[idx]
+                                if let Some(node_with_status) = validator_statuses[idx]
                                     .nodes_with_status
                                     .iter()
                                     .find(|n| n.status == crate::types::NodeStatus::Active)
                                 {
                                     node_with_status.node.label.as_str()
                                 } else {
-                                    app_state.validator_statuses[idx].nodes_with_status[0].node.label.as_str()
+                                    validator_statuses[idx].nodes_with_status[0].node.label.as_str()
                                 },
                                 real_seconds_since_vote, threshold,
                                 if simulation_active_for_idx {
@@ -756,7 +804,7 @@ async fn refresh_vote_data_for_alerts(
                                 .as_deref()
                                 .unwrap_or("unknown error");
                             let _ = log_sender.send(LogMessage {
-                                host: validator_log_host(&app_state, idx),
+                                host: validator_log_host_for(&validator_statuses, idx),
                                 message: format!(
                                     "Delinquency alert suppressed: vote-account RPC data is stale (consecutive failures: {}, last error: {})",
                                     vote_rpc_failures, last_error
@@ -793,7 +841,7 @@ async fn refresh_vote_data_for_alerts(
                                 .unwrap_or(0);
 
                             let _ = log_sender.send(LogMessage {
-                                host: validator_log_host(&app_state, idx),
+                                host: validator_log_host_for(&validator_statuses, idx),
                                 message: format!(
                                     "Delinquency alert suppressed by cooldown: {}s remaining (threshold: {}s)",
                                     remaining, threshold
@@ -806,19 +854,18 @@ async fn refresh_vote_data_for_alerts(
                             continue;
                         }
                         // Determine active node (fallback to first node)
-                        let active_node = if let Some(node_with_status) = app_state
-                            .validator_statuses[idx]
+                        let active_node = if let Some(node_with_status) = validator_statuses[idx]
                             .nodes_with_status
                             .iter()
                             .find(|n| n.status == crate::types::NodeStatus::Active)
                         {
                             node_with_status.node.clone()
                         } else {
-                            app_state.validator_statuses[idx].nodes_with_status[0].node.clone()
+                            validator_statuses[idx].nodes_with_status[0].node.clone()
                         };
 
                         // Determine priority by role: if active node is reporting as Active, it's high priority; otherwise low
-                        let is_active = app_state.validator_statuses[idx]
+                        let is_active = validator_statuses[idx]
                             .nodes_with_status
                             .iter()
                             .any(|n| n.status == crate::types::NodeStatus::Active);
@@ -837,7 +884,7 @@ async fn refresh_vote_data_for_alerts(
                 let alert_mgr_for_telegram = alert_mgr.clone();
                 let log_sender_for_telegram = log_sender.clone();
                 let identity = app_state.validator_statuses[idx].validator_pair.identity_pubkey.clone();
-                let host_for_log = validator_log_host(&app_state, idx);
+                let host_for_log = validator_log_host_for(&validator_statuses, idx);
                 let sim_idx = simulate_failover_idx();
                 let suppress_telegram = sim_idx == Some(idx);
 
@@ -983,8 +1030,7 @@ async fn refresh_vote_data_for_alerts(
                             // second poll tick cannot race the pre-warm phase.
                             emergency_takeover_flag.store(true, Ordering::Release);
 
-                            let validator_status_for_failover =
-                                app_state.validator_statuses[idx].clone();
+                            let validator_status_for_failover = validator_statuses[idx].clone();
                             let ssh_pool_for_failover = app_state.ssh_pool.clone();
                             let detected_keys_for_failover =
                                 app_state.detected_ssh_keys.clone();
@@ -1655,9 +1701,35 @@ fn clear_throttle_timestamps_for_node(validator_idx: usize, node_idx: usize) {
     guard.retain(|(vidx, nidx, _), _| !(*vidx == validator_idx && *nidx == node_idx));
 }
 
-fn validator_log_host(app_state: &AppState, validator_idx: usize) -> String {
-    app_state
-        .validator_statuses
+/// Prefer the live role for each node, falling back to the snapshot only where
+/// live state has no entry for that index.
+///
+/// `app_state` is snapshotted once per UI-loop iteration and an automatic
+/// failover does not recreate the app, so after one fires the snapshot holds
+/// the pre-failover roles indefinitely. Anything keyed off those roles is then
+/// inverted — including the direction of the next failover.
+pub(crate) fn resolve_live_roles(
+    snapshot: &[crate::types::NodeStatus],
+    live: &[crate::types::NodeStatus],
+) -> Vec<crate::types::NodeStatus> {
+    snapshot
+        .iter()
+        .enumerate()
+        .map(|(idx, snapshot_role)| live.get(idx).cloned().unwrap_or_else(|| snapshot_role.clone()))
+        .collect()
+}
+
+/// Node label to attribute a validator-level log line to, preferring the
+/// active node.
+///
+/// Callers must pass role-corrected statuses. Attributing lines using the
+/// `app_state` snapshot after a failover names the wrong node — the demoted
+/// one — on every delinquency line and alert for that pair.
+fn validator_log_host_for(
+    validator_statuses: &[crate::ValidatorStatus],
+    validator_idx: usize,
+) -> String {
+    validator_statuses
         .get(validator_idx)
         .and_then(|vs| {
             vs.nodes_with_status
@@ -5248,6 +5320,79 @@ mod shutdown_tests {
             classify_switch_attempt(Ok(false)),
             SwitchAttemptOutcome::NotCompleted
         );
+    }
+}
+
+#[cfg(test)]
+mod live_role_tests {
+    //! Failover direction, alert attribution and alert priority are all keyed
+    //! off node role, and all three read from a snapshot that goes stale the
+    //! moment an automatic failover flips the roles.
+    //!
+    //! Observed in production: the snapshot still said Primary=Active after a
+    //! failover had made Backup active. Backup then stopped voting, and svs
+    //! resolved the recovery as `Primary -> Backup` in Graceful mode — the
+    //! exact inverse. It reported success, promoted the node that had already
+    //! failed, and the vote account stayed delinquent.
+
+    use super::resolve_live_roles;
+    use crate::types::NodeStatus;
+
+    #[test]
+    fn live_roles_override_a_stale_snapshot() {
+        // Snapshot predates the failover; live state reflects it.
+        let snapshot = vec![NodeStatus::Active, NodeStatus::Standby];
+        let live = vec![NodeStatus::Standby, NodeStatus::Active];
+
+        assert_eq!(
+            resolve_live_roles(&snapshot, &live),
+            vec![NodeStatus::Standby, NodeStatus::Active],
+            "must follow live state, not the snapshot"
+        );
+    }
+
+    #[test]
+    fn failover_direction_is_not_inverted_after_a_role_swap() {
+        // Regression for the observed incident. node[0]=Primary, node[1]=Backup.
+        let snapshot = vec![NodeStatus::Active, NodeStatus::Standby];
+        let live = vec![NodeStatus::Standby, NodeStatus::Unknown];
+
+        let roles = resolve_live_roles(&snapshot, &live);
+
+        let active = roles.iter().position(|r| *r == NodeStatus::Active);
+        let standby = roles.iter().position(|r| *r == NodeStatus::Standby);
+
+        assert_eq!(active, None, "the failed node must not still look active");
+        assert_eq!(
+            standby,
+            Some(0),
+            "the healthy node must be the promotion target, not the source"
+        );
+    }
+
+    #[test]
+    fn snapshot_is_used_only_where_live_state_is_missing() {
+        let snapshot = vec![NodeStatus::Active, NodeStatus::Standby];
+
+        // Live state not yet populated at all.
+        assert_eq!(
+            resolve_live_roles(&snapshot, &[]),
+            vec![NodeStatus::Active, NodeStatus::Standby]
+        );
+
+        // Live state only knows about the first node.
+        assert_eq!(
+            resolve_live_roles(&snapshot, &[NodeStatus::Standby]),
+            vec![NodeStatus::Standby, NodeStatus::Standby]
+        );
+    }
+
+    #[test]
+    fn extra_live_entries_do_not_grow_the_result() {
+        let snapshot = vec![NodeStatus::Active];
+        let live = vec![NodeStatus::Standby, NodeStatus::Active];
+
+        assert_eq!(resolve_live_roles(&snapshot, &live), vec![NodeStatus::Standby]);
     }
 }
 
