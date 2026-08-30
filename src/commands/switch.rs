@@ -197,6 +197,11 @@ pub(crate) fn resolve_roles(nodes: &[NodeRoleInput]) -> RoleResolution {
         (None, 0) => RoleResolution::Ambiguous(
             "Cannot switch: no node is reachable. Verify RPC health and node status before attempting switch.",
         ),
+        // One known role and no verified standby: the peer is unreachable, so
+        // there is nowhere safe to promote to.
+        (Some(_), 0) => RoleResolution::Ambiguous(
+            "Cannot switch: no standby with a known role. The peer node is unreachable, so there is no verified promotion target.",
+        ),
         _ => RoleResolution::Ambiguous(
             "Cannot switch: node roles are ambiguous. Verify RPC health and node status before attempting switch.",
         ),
@@ -1887,6 +1892,45 @@ mod role_resolution_tests {
                 target_idx: 1,
                 mode: FailoverMode::Graceful,
                 reason: RoleResolutionReason::TowerRecovery,
+            }
+        );
+    }
+
+    #[test]
+    fn active_with_unreachable_peer_names_the_missing_promotion_target() {
+        // Regression: a node that was unreachable at startup stays Unknown in
+        // the app_state snapshot even after it recovers. The switch path must
+        // read live roles; if it genuinely is Active + Unknown, the refusal
+        // should say why rather than "roles are ambiguous".
+        let nodes = vec![
+            node(NodeStatus::Active, true),
+            node(NodeStatus::Unknown, false),
+        ];
+
+        let RoleResolution::Ambiguous(message) = resolve_roles(&nodes) else {
+            panic!("promoting an unverifiable node must be refused");
+        };
+        assert!(
+            message.contains("no verified promotion target"),
+            "unhelpful refusal: {message}"
+        );
+    }
+
+    #[test]
+    fn recovered_peer_makes_the_same_pair_switchable() {
+        // Same two nodes once the peer reports a role again.
+        let nodes = vec![
+            node(NodeStatus::Active, true),
+            node(NodeStatus::Standby, false),
+        ];
+
+        assert_eq!(
+            resolve_roles(&nodes),
+            RoleResolution::Resolved {
+                source_idx: 0,
+                target_idx: 1,
+                mode: FailoverMode::Graceful,
+                reason: RoleResolutionReason::ActiveAndStandby,
             }
         );
     }

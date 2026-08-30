@@ -3920,15 +3920,28 @@ fn draw_switch_ui(f: &mut ratatui::Frame, app_state: &AppState, ui_state: &UiSta
     if !app_state.validator_statuses.is_empty() {
         let validator_status = &app_state.validator_statuses[ui_state.selected_validator_index];
 
-    let role_inputs: Vec<crate::commands::switch::NodeRoleInput> = validator_status
-        .nodes_with_status
-        .iter()
-        .map(|n| crate::commands::switch::NodeRoleInput {
-            status: n.status.clone(),
-            has_tower: n.tower_path.is_some(),
-        })
-        .collect();
-    let resolution = crate::commands::switch::resolve_roles(&role_inputs);
+        // Roles come from live UI state; `app_state` holds the roles detected
+        // at startup, so a node that was unreachable then would still read as
+        // Unknown here and the plan would render as ambiguous even though both
+        // nodes are healthy. Tower presence still comes from `app_state`.
+        let live_nodes = ui_state
+            .validator_statuses
+            .get(ui_state.selected_validator_index)
+            .map(|vs| &vs.nodes_with_status);
+
+        let role_inputs: Vec<crate::commands::switch::NodeRoleInput> = validator_status
+            .nodes_with_status
+            .iter()
+            .enumerate()
+            .map(|(idx, n)| crate::commands::switch::NodeRoleInput {
+                status: live_nodes
+                    .and_then(|nodes| nodes.get(idx))
+                    .map(|live| live.status.clone())
+                    .unwrap_or_else(|| n.status.clone()),
+                has_tower: n.tower_path.is_some(),
+            })
+            .collect();
+        let resolution = crate::commands::switch::resolve_roles(&role_inputs);
 
     let mut status_text = vec![];
     status_text.push(
@@ -5245,6 +5258,25 @@ pub async fn show_enhanced_status_ui(app_state: &AppState) -> Result<()> {
         {
             let ui_state_guard = app.ui_state.read().await;
             current_app_state.selected_validator_index = ui_state_guard.selected_validator_index;
+
+            // Roles must be refreshed from live UI state too. `current_app_state`
+            // carries the roles detected at startup, and a node that was
+            // unreachable then stays recorded as Unknown even after it recovers
+            // and the UI shows it as Standby. The switch would then resolve
+            // against Active + Unknown and refuse as ambiguous, blocking a
+            // perfectly valid swap between two healthy nodes.
+            for (validator_idx, validator) in
+                current_app_state.validator_statuses.iter_mut().enumerate()
+            {
+                let Some(live) = ui_state_guard.validator_statuses.get(validator_idx) else {
+                    continue;
+                };
+                for (node_idx, node) in validator.nodes_with_status.iter_mut().enumerate() {
+                    if let Some(live_node) = live.nodes_with_status.get(node_idx) {
+                        node.status = live_node.status.clone();
+                    }
+                }
+            }
         }
 
         let outcome = classify_switch_attempt(
