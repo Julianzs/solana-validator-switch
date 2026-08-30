@@ -100,13 +100,63 @@ fn compute_missed_votes(
     (missed, effective_window)
 }
 
-/// Timeout for a single cluster RPC call.
+/// Timeout for the cluster RPC calls vote monitoring depends on.
 ///
-/// The previous 3s was below this endpoint's tail latency — a cold
-/// `getAccountInfo` against api.testnet.solana.com was measured at 8.4s while
-/// warm calls returned in ~0.2s. Three calls at this bound still fit inside the
-/// 60s vote poll interval.
+/// The original 3s was below this endpoint's tail latency. Two calls at this
+/// bound still fit inside the 60s vote poll interval.
 const RPC_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Timeout for the optional vote-account enrichment call.
+///
+/// `api.testnet.solana.com` answers `getAccountInfo` in ~0.2s most of the time
+/// but intermittently stalls for 5-10s. Enrichment is decoration, so it gets a
+/// tight budget: waiting on it would delay the delinquency check behind it by
+/// longer than the 30s delinquency threshold is trying to detect.
+const ENRICHMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Whether an enrichment state change is worth a log line.
+///
+/// Enrichment runs every poll. Logging each failure produced one warning per
+/// minute forever; logging only transitions reports the same information once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EnrichmentTransition {
+    /// Enrichment just started failing.
+    Degraded,
+    /// Enrichment just started working again.
+    Recovered,
+    /// No change since the last poll.
+    Unchanged,
+}
+
+/// Compare the current enrichment outcome against the previous one.
+pub(crate) fn enrichment_transition(
+    previously_ok: Option<bool>,
+    currently_ok: bool,
+) -> EnrichmentTransition {
+    match (previously_ok, currently_ok) {
+        (Some(true), false) | (None, false) => EnrichmentTransition::Degraded,
+        (Some(false), true) => EnrichmentTransition::Recovered,
+        _ => EnrichmentTransition::Unchanged,
+    }
+}
+
+/// Last enrichment outcome per vote account, so only transitions are logged.
+fn enrichment_state() -> &'static std::sync::Mutex<std::collections::HashMap<String, bool>> {
+    static STATE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, bool>>,
+    > = std::sync::OnceLock::new();
+    STATE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Record the outcome and report whether it changed.
+fn record_enrichment_outcome(vote_pubkey: &str, ok: bool) -> EnrichmentTransition {
+    let Ok(mut state) = enrichment_state().lock() else {
+        return EnrichmentTransition::Unchanged;
+    };
+    let transition = enrichment_transition(state.get(vote_pubkey).copied(), ok);
+    state.insert(vote_pubkey.to_string(), ok);
+    transition
+}
 
 /// Why a cluster RPC call failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -235,24 +285,41 @@ fn fetch_vote_account_data_blocking(
     // abort — returning Err would mark the whole poll a vote-RPC failure, and
     // auto-failover is gated on `vote_rpc_failures == 0`, so a slow optional
     // call would silently disarm failover.
-    let vote_state = match rpc_client.get_account(&vote_pubkey) {
-        Ok(account_data) => solana_sdk::vote::state::VoteState::deserialize(&account_data.data).ok(),
+    //
+    // It gets its own short-timeout client so a stalled optional call cannot
+    // hold up the delinquency check that follows it.
+    let enrichment_client =
+        RpcClient::new_with_timeout(rpc_url.to_string(), ENRICHMENT_TIMEOUT);
+    let vote_state = match enrichment_client.get_account(&vote_pubkey) {
+        Ok(account_data) => {
+            if record_enrichment_outcome(vote_pubkey_str, true) == EnrichmentTransition::Recovered {
+                crate::startup_logger::append_runtime_log(
+                    "INFO",
+                    vote_pubkey_str,
+                    "Vote account enrichment recovered; full vote metrics available again.",
+                );
+            }
+            solana_sdk::vote::state::VoteState::deserialize(&account_data.data).ok()
+        }
         Err(error) => {
-            let detail = error.to_string();
-            let reason = match classify_rpc_failure(&detail) {
-                RpcFailureKind::Timeout => "request timed out",
-                RpcFailureKind::Other => "request failed",
-            };
-            // File-only: this runs while the TUI owns the terminal, so stderr
-            // writes would corrupt the display.
-            crate::startup_logger::append_runtime_log(
-                "WARNING",
-                vote_pubkey_str,
-                &format!(
-                    "Vote account enrichment unavailable ({reason}); \
-                     continuing with vote data from getVoteAccounts. Detail: {detail}"
-                ),
-            );
+            if record_enrichment_outcome(vote_pubkey_str, false) == EnrichmentTransition::Degraded {
+                let detail = error.to_string();
+                let reason = match classify_rpc_failure(&detail) {
+                    RpcFailureKind::Timeout => "request timed out",
+                    RpcFailureKind::Other => "request failed",
+                };
+                // File-only: this runs while the TUI owns the terminal, so
+                // stderr writes would corrupt the display.
+                crate::startup_logger::append_runtime_log(
+                    "WARNING",
+                    vote_pubkey_str,
+                    &format!(
+                        "Vote account enrichment unavailable ({reason}); continuing with vote \
+                         data from getVoteAccounts. Vote latency and missed-vote metrics will \
+                         show as unavailable until it recovers. Detail: {detail}"
+                    ),
+                );
+            }
             None
         }
     };
@@ -342,7 +409,50 @@ mod vote_data_degradation_tests {
     //! failure — and because auto-failover requires `vote_rpc_failures == 0`,
     //! that silently disarmed failover until the process was restarted.
 
-    use super::{build_recent_votes, classify_rpc_failure, RpcFailureKind};
+    use super::{
+        build_recent_votes, classify_rpc_failure, enrichment_transition, EnrichmentTransition,
+        RpcFailureKind,
+    };
+
+    #[test]
+    fn repeated_enrichment_failures_are_logged_once_not_every_poll() {
+        // Enrichment runs every 60s. Logging each failure produced one warning
+        // per minute indefinitely; only the transitions carry information.
+        assert_eq!(
+            enrichment_transition(None, false),
+            EnrichmentTransition::Degraded,
+            "first failure should be reported"
+        );
+        assert_eq!(
+            enrichment_transition(Some(false), false),
+            EnrichmentTransition::Unchanged,
+            "still-failing must stay silent"
+        );
+        assert_eq!(
+            enrichment_transition(Some(false), true),
+            EnrichmentTransition::Recovered,
+            "recovery should be reported"
+        );
+        assert_eq!(
+            enrichment_transition(Some(true), true),
+            EnrichmentTransition::Unchanged,
+            "steady-state success must stay silent"
+        );
+        assert_eq!(
+            enrichment_transition(Some(true), false),
+            EnrichmentTransition::Degraded,
+            "regression after success should be reported"
+        );
+    }
+
+    #[test]
+    fn first_successful_poll_is_silent() {
+        // Normal startup must not announce that nothing is wrong.
+        assert_eq!(
+            enrichment_transition(None, true),
+            EnrichmentTransition::Unchanged
+        );
+    }
 
     #[test]
     fn enrichment_loss_still_yields_a_vote_from_get_vote_accounts() {
